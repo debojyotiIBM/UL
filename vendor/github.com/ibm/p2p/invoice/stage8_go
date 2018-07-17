@@ -1,0 +1,157 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/po"
+	//	util "github.com/ibm/p2p"
+	// "github.com/ibm/db"
+	"math"
+)
+
+/*
+	Match Price Per Unit
+*/
+
+func MatchPricePerUnit(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+	if fetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 01", invStat
+	}
+
+	myLogger.Debugf("po in MatchPricePerUnit", po)
+	linesWithPriceMismatch := ""
+	for _, invoiceLine := range *invoice.DcLines() {
+		//priceMargin := util.GetFloatFromString(invoiceLine.Unit_Price) / 10
+		invPrice := 0.0
+
+		for _, poLine := range *po.LineItems() {
+
+			myLogger.Debugf("line item number", poLine.PoLine())
+			myLogger.Debugf("Invoice po line", invoiceLine.PoLine())
+			if invoiceLine.PoLine() == poLine.PoLine() {
+
+				myLogger.Debugf("Entered if condition in po.LineItems()=========", invoiceLine.PoLine())
+				poUnitPrice := poLine.PoUnitNetPrice()
+
+				myLogger.Debugf("poUnitPrice in MatchPricePerUnit", poUnitPrice)
+
+				if poUnitPrice == 1 {
+					invPrice = invoiceLine.Quantity()
+					myLogger.Debugf("New change made in MatchPricePerUnit", invPrice)
+				} else {
+					invPrice = invoiceLine.UnitPrice()
+					myLogger.Debugf("Old change made in MatchPricePerUnit", invPrice)
+				}
+
+				myLogger.Debugf("invPrice in MatchPricePerUnit", invPrice)
+
+				priceMargin := poUnitPrice / 10
+
+				priceMarginDecider := math.Min(priceMargin, 250)
+
+				pofinalUnitPrice := poUnitPrice + priceMarginDecider
+
+				myLogger.Debugf("Pounit price,Invoice price with tollerence", pofinalUnitPrice, invPrice)
+				if !(invPrice <= pofinalUnitPrice) {
+					myLogger.Debugf("Entered if condition in price match tollerence", invPrice)
+					if linesWithPriceMismatch != "" {
+						linesWithPriceMismatch = linesWithPriceMismatch + ","
+					}
+					linesWithPriceMismatch = linesWithPriceMismatch + util.GetStringFromInt(invoiceLine.InvoiceLine())
+				}
+			}
+		}
+	}
+
+	if linesWithPriceMismatch == "" {
+		myLogger.Debugf("PRICE MATCHES FOR ALL INVOICE LINES")
+		myLogger.Debugf("Tax_Code in price match per unit match step==========")
+		myLogger.Debugf("Tax_Code==========", invoice.TaxCode())
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST01101", EMPTY_ADDITIONAL_INFO)
+		//	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSED, "", "", "ST0801", EMPTY_ADDITIONAL_INFO)
+
+		/* POST INVOICE PASS THROUGH, UPDATE FOLLOWING
+		1. DUPLICATE TABLE
+		2. UPDATE INVOICE STATUS HISTORY
+		3. UPDATE PO RESIDUALS
+		*/
+		/*db.TableStruct{Stub: stub, TableName:util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), invoice.TotalAmount(), VENDOR_ID}, Data: ""}.Add()
+		StoreInvoiceStatusHistory(stub, invoice.BCIID(), invoice.InvoiceNumber(), INV_STATUS_PROCESSED)
+		StorePOResiduals(stub)
+		StoreGRNResiduals(stub)*/
+		return 1, errStr, invStat
+	}
+
+	myLogger.Debugf("PRICE DOESN'T MATCH FOR ALL INVOICE LINES")
+	// @TODO: Trigger an Email to buyer / planner
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_BUYER, INV_RS_PRICE_APPROVAL, "", "ST0802", CreateAdditionalInfo("INVOICE LINES WITH PRICE MISMATCH", linesWithPriceMismatch))
+	return 2, errStr, invStat
+}
+
+func MatchPricePerUnit_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION - , invStat.Status()")
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		invStat = UpdateInvoiceStatus(stub, invStat.BciId(), invStat.InvoiceNumber(), INV_STATUS_PROCESSING, invStat.ReasonCode(), invStat.Comments(), "ST01101", EMPTY_ADDITIONAL_INFO)
+		//	  invStat = UpdateInvoiceStatus(stub, invStat.BciId(), invStat.InvoiceNumber(), INV_STATUS_PROCESSED, invStat.ReasonCode(), invStat.Comments(), "ST0803", EMPTY_ADDITIONAL_INFO)
+
+		/* POST INVOICE PASS THROUGH, UPDATE FOLLOWING
+		1. DUPLICATE TABLE
+		2. UPDATE INVOICE STATUS HISTORY
+		3. UPDATE PO RESIDUALS
+		*/
+		// db.TableStruct{Stub: stub, TableName:util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), invoice.TotalAmount(), VENDOR_ID}, Data: ""}.Add()
+		//StoreInvoiceStatusHistory(stub, invoice.BCIID(), invoice.InvoiceNumber(), INV_STATUS_PROCESSED)
+		StorePOResiduals(stub)
+		StoreGRNResiduals(stub)
+		return 1, errStr, invStat
+	} else if invStat.Status() == USR_BUYER_ACT_ALT_PO {
+		myLogger.Debugf("entered alternate PO loop=====================")
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_INVOICE_FIX, invStat.ReasonCode(), invStat.Comments(), "ST0001", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+		myLogger.Debugf("Revert GRN Start")
+		RevertGRNResidualQuantity(stub, invoice)
+		STORE_INVOICE = true
+		SetInvoiceForProcessing(invoice)
+
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0804", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+
+	//Return to AP disabled for as of now
+	/*	} else if invStat.Status() == USR_BUYER_ACT_RETURN {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, invStat.ReasonCode(), invStat.Comments(), "ST0608", EMPTY_ADDITIONAL_INFO)
+	}*/
+	return 2, errStr, invStat
+}

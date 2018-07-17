@@ -1,0 +1,87 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	"github.com/ibm/p2p/po"
+	//	util "github.com/ibm/p2p"
+)
+
+/*
+	Duplicate Invoice Check
+*/
+
+func VerifyAdditionaLineItems(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	if len(*invoice.AdditionalLineItems()) > 0 {
+		myLogger.Debugf("ADDITIONAL LINE ITEMS ARE PRESENT")
+
+		var lineItem []DCLine
+		lineItem = *invoice.AdditionalLineItems()
+		for _, line := range lineItem {
+			myLogger.Debugf("Additional lines===================", line)
+			totalamount := line.Amount()
+			if totalamount > 250 {
+				invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_BUYER, INV_RS_ADDITIONAL_LI_APPROVAL, "", "ST0702", EMPTY_ADDITIONAL_INFO)
+				return 2, errStr, invStat
+			}
+		}
+	}
+	myLogger.Debugf("ADDITIONAL LINE ITEMS ARE NOT PRESENT")
+	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0701", EMPTY_ADDITIONAL_INFO)
+	return 1, errStr, invStat
+}
+
+func VerifyAdditionaLineItems_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION - ", invStat.Status())
+	var errStr string
+
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		invStat = UpdateInvoiceStatus(stub, invStat.BciId(), invStat.InvoiceNumber(), INV_STATUS_PROCESSING, invStat.ReasonCode(), "", "ST0703", EMPTY_ADDITIONAL_INFO)
+		return 1, errStr, invStat
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0704", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	} else if invStat.Status() == USR_BUYER_ACT_RETURN {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, invStat.ReasonCode(), invStat.Comments(), "ST0704", EMPTY_ADDITIONAL_INFO)
+	}
+	return 2, errStr, invStat
+}
+
+func VerifyAdditionaLineItems_AP_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("IBM AP ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_AP_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0705", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.Status() == USR_AP_ACT_RETURN_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, invStat.ReasonCode(), invStat.Comments(), "ST0702", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}

@@ -1,0 +1,138 @@
+package invoice
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	pb "github.com/hyperledger/fabric/protos/peer"
+	"github.com/ibm/db"
+	util "github.com/ibm/p2p"
+	em "github.com/ibm/p2p/email"
+	"github.com/ibm/p2p/po"
+	"github.com/ibm/p2p/vmd"
+)
+
+//Simple Custome Event To Show How Custom events Can be created and published
+
+type customEvent struct {
+	InvoiceNum_  string `json:"Invoice_Num"`
+	BciId_       string `json:"BciId"`
+	Status_      string
+	VendorEmail_ string
+	Time_        string
+}
+
+func (customevent *customEvent) InvoiceNum() string {
+	return customevent.InvoiceNum_
+}
+
+func (customevent *customEvent) SetInvoiceNum(InvoiceNum string) {
+	customevent.InvoiceNum_ = InvoiceNum
+}
+
+func (customevent *customEvent) BciId() string {
+	return customevent.BciId_
+}
+
+func (customevent *customEvent) SetBciId(BciId string) {
+	customevent.BciId_ = BciId
+}
+
+func (customevent *customEvent) Status() string {
+	return customevent.Status_
+}
+
+func (customevent *customEvent) SetStatus(Status string) {
+	customevent.Status_ = Status
+}
+
+func (customevent *customEvent) VendorEmail() string {
+	return customevent.VendorEmail_
+}
+
+func (customevent *customEvent) SetVendorEmail(VendorEmail string) {
+	customevent.VendorEmail_ = VendorEmail
+}
+
+func (customevent *customEvent) Time() string {
+	return customevent.Time_
+}
+
+func (customevent *customEvent) SetTime(Time string) {
+	customevent.Time_ = Time
+}
+
+func TriggerEvent(stub shim.ChaincodeStubInterface, invoice Invoice, invStatus string) pb.Response {
+
+	invoiceNo := invoice.InvoiceNumber()
+	bciId := invoice.BCIID()
+	status := invStatus
+	time := time.Now().Local().String()
+	var toEmailId string
+
+	if status == "REJECTED" || status == "PROCESSED" {
+
+		InvVendorDetails, err1 := vmd.GetVendor(stub, invoice.ErpSystem(), invoice.VendorID())
+		if err1 == "" {
+			toEmailId = InvVendorDetails.VendorEmail()
+		}
+	}
+
+	if status == "AWAITING BUYER ACTION" {
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber()})
+		if fetchErr == "" && po.BuyerEmailId() != "" {
+			toEmailId = po.BuyerEmailId()
+		} else if fetchErr == "" && po.BuyerID() != "" {
+			buyerEmail, err := em.GetEmail(stub, po.BuyerID())
+			if err == "" {
+				toEmailId = buyerEmail.Email()
+			}
+		} else if fetchErr == "" && po.PlannerEmailID() != "" {
+			toEmailId = po.PlannerEmailID()
+		} else if fetchErr == "" && po.PlannerID() != "" {
+			plannerEmail, err := em.GetEmail(stub, po.PlannerID())
+			if err == "" {
+				toEmailId = plannerEmail.Email()
+			}
+		}
+	}
+
+	myLogger.Debugf("Trigger event started====================")
+
+	var event = customEvent{invoiceNo, bciId, status, toEmailId, time}
+	myLogger.Debugf("Values set for event====================", event)
+
+	db.TableStruct{Stub: stub, TableName: util.TAB_EVENT_HISTORY, PrimaryKeys: []string{event.InvoiceNum(), event.BciId()}, Data: string(util.MarshalToBytes(event))}.Add()
+
+	eventBytes, _ := json.Marshal(&event)
+	errMsg := stub.SetEvent("messageEvent", eventBytes)
+	if errMsg != nil {
+		myLogger.Debugf("ERROR in trigerring events======", errMsg)
+	}
+
+	myLogger.Debugf("Trigger event completed=====================", eventBytes)
+
+	responsePayload := "{\"ResponseCode:200\",\"status:" + "success" + "\"}"
+	return shim.Success([]byte(responsePayload))
+
+}
+
+func GetAllEvents(stub shim.ChaincodeStubInterface) pb.Response {
+
+	eventRecords, _ := db.TableStruct{Stub: stub, TableName: util.TAB_EVENT_HISTORY, PrimaryKeys: []string{}, Data: ""}.GetAll()
+	var eventsArr []customEvent
+	var event customEvent
+
+	for _, evt := range eventRecords {
+		errEvent := json.Unmarshal([]byte(evt), &event)
+		if errEvent != nil {
+			myLogger.Debugf("ERROR parsing events", evt, errEvent)
+			return shim.Error("ERROR parsing events")
+		}
+		eventsArr = append(eventsArr, event)
+	}
+
+	return shim.Success(util.MarshalToBytes(eventsArr))
+
+}

@@ -1,0 +1,51 @@
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	//  "github.com/ibm/db"
+	//  util "github.com/ibm/p2p"
+
+	"github.com/ibm/p2p/po"
+)
+
+/*
+ 		Post Facto PO
+
+	If PO creation date is after the invoice date, please reject the invoice from Block chain and the rejected invoice
+	should reflect in all 3 UI with the reason code as "Invoice Date is prior to PO creation Date".
+
+	This step need to be placed right after the Duplicate Check in the block chain.
+*/
+
+func VerifyPoCreationDate(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+
+	var invStat InvoiceStatus
+	var errStr string
+	//layout_invoice := "02-01-2006"
+	const shortForm = "02/01/2006"
+
+	po, poFetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+	if poFetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	poDate := po.Podate().Time()
+	myLogger.Debugf("Po creation date in stage 12======== ", poDate)
+	invDate := invoice.DocDate().Time()
+	myLogger.Debugf("Invoice date in stage 12======== ", invDate)
+
+	if poDate.After(invDate) {
+		myLogger.Debugf("FAILED POST FACTO PO STAGE================")
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_POST_FACTO_PO, "", "ST01202", EMPTY_ADDITIONAL_INFO)
+		return 2, errStr, invStat
+	}
+
+	myLogger.Debugf("PASSED POST FACTO PO STAGE============== ")
+	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0501", EMPTY_ADDITIONAL_INFO)
+	// db.TableStruct{Stub: stub, TableName:util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), invoice.TotalAmount(), VENDOR_ID}, Data: ""}.Add()
+	// StoreInvoiceStatusHistory(stub, invoice.BCIID(), invoice.InvoiceNumber(), INV_STATUS_PROCESSED)
+
+	return 1, "", invStat
+}

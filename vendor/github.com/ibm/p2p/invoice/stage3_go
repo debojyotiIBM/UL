@@ -1,0 +1,142 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	em "github.com/ibm/p2p/email"
+	"github.com/ibm/p2p/po"
+	//util "github.com/ibm/p2p"
+)
+
+/*
+	Check PO is Deleted / Blocked / Closed
+*/
+
+func VerifyDeletedOrBlockedPO(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+
+	var invStat InvoiceStatus
+	var errStr string
+
+	// Get the Company Code from PO
+	po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+	if fetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, fetchErr, invStat
+	}
+
+	if isPOBlockedOrDeleted(po) {
+		if invStat.Status() == INV_STATUS_WAITING_PO_REFRESH {
+			myLogger.Debugf("PO DELETED / BLOCKED / CLOSED - Still waiting for DB refresh")
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_WAITING_PO_REFRESH, INV_RS_INVALID_PO_STATUS, "", "ST0307", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		}
+		if invStat.Status() == INV_STATUS_WAITING_EMAIL_REFRESH {
+			myLogger.Debugf("PO DELETED / BLOCKED / CLOSED - Buyer is still not notified")
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_WAITING_EMAIL_REFRESH, INV_RS_INVALID_PO_STATUS, "", "ST0307", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		}
+
+		var additionalInfo AdditionalInfo
+		contactInfoFound := false
+
+		if po.BuyerEmailId() != "" {
+			additionalInfo.SetType("Buyer Email")
+			additionalInfo.SetValue(po.BuyerEmailId())
+			contactInfoFound = true
+		} else if po.BuyerID() != "" {
+			email, fetchErr := em.GetEmail(stub, po.BuyerID())
+			if fetchErr != "" {
+				additionalInfo.SetType("Buyer Email")
+				additionalInfo.SetValue(email.Email())
+				contactInfoFound = true
+			}
+		} else if po.PlannerEmailID() != "" {
+			additionalInfo.SetType("Planner Email")
+			additionalInfo.SetValue(po.PlannerEmailID())
+			contactInfoFound = true
+
+		} else if po.PlannerID() != "" {
+			email, fetchErr := em.GetEmail(stub, po.PlannerID())
+			if fetchErr != "" {
+				additionalInfo.SetType("Buyer Email")
+				additionalInfo.SetValue(email.Email())
+				contactInfoFound = true
+			}
+		}
+
+		if !contactInfoFound {
+			if invStat.Status() == INV_STATUS_PENDING_VMD && invStat.ReasonCode() == INV_RS_PENDING_VMD_UPDATE {
+				invStat = CreateInvoiceStatus(stub, invStat.BciId(), invoice.ScanID(), "", "", "", "ST0310", EMPTY_ADDITIONAL_INFO)
+			} else {
+				invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_EMAIL_MISSING, "", "ST0302", EMPTY_ADDITIONAL_INFO)
+			}
+			return 2, errStr, invStat
+		}
+		//		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_TRIGGER_EMAIL, INV_RS_INVALID_PO_STATUS, "", "ST0301", EMPTY_ADDITIONAL_INFO)
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_BUYER, INV_RS_INVALID_PO_STATUS, "", "ST0305", EMPTY_ADDITIONAL_INFO)
+		return 2, errStr, invStat
+	}
+
+	myLogger.Debugf("PO IS ACTIVE ")
+	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0303", EMPTY_ADDITIONAL_INFO)
+	return 1, errStr, invStat
+}
+
+func isPOBlockedOrDeleted(po po.PO) bool {
+	for _, line := range *po.LineItems() {
+		if line.PoStatus() == "DELETED" || line.PoStatus() == "BLOCKED" || line.PoStatus() == "CLOSED" {
+			return true
+		}
+	}
+	return false
+}
+func VerifyDeletedOrBlockedPO_AP_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("IBM AP ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_AP_ACT_PENDING_VMD {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_VMD, INV_RS_PENDING_VMD_UPDATE, invStat.Comments(), "ST0310", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_RETURN_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, invStat.ReasonCode(), invStat.Comments(), "ST0305", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0306", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+
+	}
+	return 2, errStr, invStat
+}
+
+func VerifyDeletedOrBlockedPO_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION STATUS - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_UNBLOCK_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_PO_REFRESH, invStat.ReasonCode(), invStat.Comments(), "ST0307", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_BUYER_ACT_ALT_PO {
+		myLogger.Debugf("entered alternate PO loop=====================")
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_INVOICE_FIX, invStat.ReasonCode(), invStat.Comments(), "ST0001", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0309", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.Status() == USR_BUYER_ACT_RETURN {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, invStat.ReasonCode(), invStat.Comments(), "ST0311", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+
+	}
+	return 2, errStr, invStat
+}

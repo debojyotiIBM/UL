@@ -1,0 +1,428 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"encoding/json"
+	"math"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	"github.com/ibm/db"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/po"
+)
+
+/*
+	Line Item Selection
+*/
+
+func SelectLineItem(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat, invStatTemp InvoiceStatus
+	var errStr, errStrTmp string
+	var intStatus int
+	var totalInvQty float64
+	invoiceType := "SERVICE"
+
+	if invoiceType == "SERVICE" {
+		// Most of the invoices specify only the amount and its silent on the qty part (at a line level).
+		// hence, price per unit should be 1 and the qty should be the line amount.
+
+		inv_po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+
+		/*isSingleLinePo := false*/
+		boolInvStatus := true
+		isSingleLinePoAlone := false
+		totalInvQty = 0.0
+		// Check po is single / multiline
+		/*if len(inv_po.LineItems()) == 1 && len(invoice.DcLines()) == 1 {
+			isSingleLinePo = true
+		}*/
+		if len(*inv_po.LineItems()) == 1 {
+			isSingleLinePoAlone = true
+		}
+
+		if isSingleLinePoAlone {
+			for invIdx, InvoiceLineItem := range *invoice.DcLines() {
+				myLogger.Debugf("Length of invoice lines=============>", len(*invoice.DcLines()))
+				myLogger.Debugf("Invoice line index =============>", invIdx)
+				if (*inv_po.LineItems())[0].PoUnitNetPrice() == InvoiceLineItem.UnitPrice() {
+					myLogger.Debugf("Invoice unit price and Po unit price equal =============>")
+					if (*inv_po.LineItems())[0].PoUnitNetPrice() == 1.0 {
+						myLogger.Debugf("unit price is 1.0 =============>")
+						//do sum of qty
+						totalInvQty = totalInvQty + InvoiceLineItem.UnitPrice()
+						intStatus, errStr, invStat = MatchDescriptionForSingleLinePo(stub, invIdx, invoice)
+					} else {
+						myLogger.Debugf("unit price is more/less than 1.0 =============>")
+						InvoiceLineItem.SetUnitPrice(1.0)
+						InvoiceLineItem.SetQuantity(InvoiceLineItem.Amount() - InvoiceLineItem.TaxAmount())
+						totalInvQty = totalInvQty + InvoiceLineItem.Quantity()
+						intStatus, errStr, invStat = MatchDescriptionForSingleLinePo(stub, invIdx, invoice)
+					}
+					//end of POUnitPrice==InvUnitPrice
+				} else if (*inv_po.LineItems())[0].PoUnitNetPrice() == 1.0 {
+					myLogger.Debugf("Swapping inv unit Price and Quantity=============>")
+					if InvoiceLineItem.Quantity() <=
+						(*inv_po.LineItems())[0].PoUnitNetPrice() {
+						myLogger.Debugf("inv.qty is <= po.up========")
+						totalInvQty = totalInvQty + InvoiceLineItem.UnitPrice()
+						intStatus, errStr, invStat = MatchDescriptionForSingleLinePo(stub, invIdx, invoice)
+					} else if WithinTolerance((*inv_po.LineItems())[0].PoUnitNetPrice(), InvoiceLineItem.Quantity()) {
+						myLogger.Debugf("after tolerance check =============>")
+						totalInvQty = totalInvQty + InvoiceLineItem.UnitPrice()
+						intStatus, errStr, invStat = MatchDescriptionForSingleLinePo(stub, invIdx, invoice)
+					} else {
+						//set invoice status for else case
+						invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_PRICE, "", "ST0605", EMPTY_ADDITIONAL_INFO)
+					}
+				} else {
+					myLogger.Debugf("Unit price is not 1=============>")
+					if InvoiceLineItem.UnitPrice() <=
+						(*inv_po.LineItems())[0].PoUnitNetPrice() {
+						myLogger.Debugf("unit price is <= po.up")
+						totalInvQty = totalInvQty + InvoiceLineItem.Quantity()
+						intStatus, errStr, invStat = MatchDescriptionForSingleLinePo(stub, invIdx, invoice)
+					} else if WithinTolerance((*inv_po.LineItems())[0].PoUnitNetPrice(), InvoiceLineItem.UnitPrice()) {
+						//tolerance check
+						myLogger.Debugf("else condn of unit price is <= po.up--tolerance check")
+						totalInvQty = totalInvQty + InvoiceLineItem.Quantity()
+						intStatus, errStr, invStat = MatchDescriptionForSingleLinePo(stub, invIdx, invoice)
+					} else {
+						myLogger.Debugf("Inv price mismatch..status saved")
+						invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_PRICE, "", "ST0605", EMPTY_ADDITIONAL_INFO)
+					}
+				}
+				if invStat.Status() == INV_STATUS_PENDING_AP {
+					boolInvStatus = false
+					invStatTemp = invStat
+					errStrTmp = errStr
+					//return 2, errStr, invStat
+				}
+			} //end of 'for' loop
+			myLogger.Debugf("sum of invoice qty is  =============>", totalInvQty)
+			//do qty check here
+			myLogger.Debugf("Doing qty check here  =============>")
+			intStatus, errStr, invStat = QuantityCheckForSingleLinePo(stub, totalInvQty, GetUpdatedResidualPOQty(inv_po, (*inv_po.LineItems())[0]), invoice)
+			if !boolInvStatus {
+				myLogger.Debugf("Price mismatch status returned")
+				return 2, errStrTmp, invStatTemp
+			} else {
+				myLogger.Debugf("Qty check status returned=========")
+				return intStatus, errStr, invStat
+			}
+		} else {
+			// multiline PO
+			allLineItemsFound := true
+			var poSelectedLines []int
+			var unSelectedLinesInfo string
+			for invIdx, InvoiceLineItem := range *invoice.DcLines() {
+				foundLineItem := false
+				for poLineItemIndex, lineItem := range *inv_po.LineItems() {
+					quantityMathed := false
+					priceMatched := false
+					descMatched := false
+
+					// Check Quantity
+					//if util.GetFloatFromString(InvoiceLineItem.Quantity()) == 1 { Punnakhai
+					if lineItem.PoUnitNetPrice() == 1 {
+						myLogger.Debugf("New check multi line- Po unit price =============>", lineItem.PoUnitNetPrice())
+						if InvoiceLineItem.UnitPrice() <= GetUpdatedResidualPOQty(inv_po, lineItem) {
+							quantityMathed = true
+							UpdatePOResidual(inv_po, lineItem.PoLine(), InvoiceLineItem.UnitPrice())
+						}
+						if InvoiceLineItem.Quantity() == lineItem.PoUnitNetPrice() {
+							priceMatched = true
+						}
+					} else {
+						if InvoiceLineItem.Quantity() <= GetUpdatedResidualPOQty(inv_po, lineItem) {
+							quantityMathed = true
+							UpdatePOResidual(inv_po, lineItem.PoLine(), InvoiceLineItem.Quantity())
+						}
+						if InvoiceLineItem.UnitPrice() == lineItem.PoUnitNetPrice() {
+							priceMatched = true
+						}
+					}
+
+					// Check Description
+					if util.ProbableMatch(InvoiceLineItem.Description(), lineItem.LineItemDescription()) {
+						descMatched = true
+					}
+
+					myLogger.Debugf("quantityMathed,priceMatched,descMatched==============>", quantityMathed)
+					myLogger.Debugf("priceMatched,============", priceMatched)
+					myLogger.Debugf("descMatched,============", descMatched)
+
+					if quantityMathed && priceMatched && descMatched {
+						myLogger.Debugf("Entered if condition=================", quantityMathed)
+						//	alreadySelected := isLineSelected(poSelectedLines, poLineItemIndex)
+						//	if !alreadySelected {
+
+						myLogger.Debugf("LineItemNumber in stage 6=============", lineItem.PoLine())
+
+						(*invoice.DcLines())[invIdx].SetPoLine(lineItem.PoLine())
+
+						myLogger.Debugf("POLine in stage 6=============", (*invoice.DcLines())[invIdx].PoLine())
+						myLogger.Debugf("Invoice index==========", invIdx)
+						// INVOICE_PO_LINE_MAP[invoice.BCIID() + "|" +  invoice.InvoiceNumber() + "|" + InvoiceLineItem.Invoice_Line] = inv_po.PoNumber + "|" + lineItem.LineItemNumber
+						foundLineItem = true
+						poSelectedLines = append(poSelectedLines, poLineItemIndex)
+						break
+						//	}
+					}
+				}
+				if !foundLineItem {
+					allLineItemsFound = false
+					if unSelectedLinesInfo != "" {
+						unSelectedLinesInfo = unSelectedLinesInfo + " and " + util.GetStringFromInt(InvoiceLineItem.InvoiceLine())
+					}
+				}
+			}
+
+			myLogger.Debugf("allLineItemsFound =======", allLineItemsFound)
+
+			if allLineItemsFound {
+				invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0612", EMPTY_ADDITIONAL_INFO)
+				// StoreInvoicePOLineMapping(stub)
+				STORE_INVOICE = true
+				SetInvoiceForProcessing(invoice)
+				return 1, errStr, invStat
+			}
+			if unSelectedLinesInfo != "" {
+				unSelectedLinesInfo = "Lines " + unSelectedLinesInfo + " didn't find a match in corresponding PO"
+			}
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_LINE, "", "ST0613", CreateAdditionalInfo("UNSELECTED LINES IN LINE ITEM SELECTION", unSelectedLinesInfo))
+			return 2, errStr, invStat
+
+		}
+	} else if invoiceType == "GOODS" {
+		// @TODO : Not planned for current pilot
+	}
+	return 2, errStr, invStat
+}
+
+func isLineSelected(poSelectedLines []int, poLineItemIndex int) bool {
+	for _, element := range poSelectedLines {
+		if poLineItemIndex == element {
+			return true
+		}
+	}
+	return false
+}
+func WithinTolerance(poUnitPrice float64, invUnitPrice float64) bool {
+	myLogger.Debugf("Within tolerance check =============>")
+	poUP := poUnitPrice
+	invUP := invUnitPrice
+
+	priceMargin := poUP / 10
+	myLogger.Debugf("Price Margin============>", priceMargin)
+
+	priceMarginDecider := math.Min(priceMargin, 250)
+	myLogger.Debugf("Price Margin============>", priceMarginDecider)
+
+	pofinalUnitPrice := poUP + priceMarginDecider
+
+	myLogger.Debugf("Pounit price,Invoice price with tollerence", pofinalUnitPrice, invUP)
+
+	if invUP <= pofinalUnitPrice {
+		return true
+	}
+	return false
+}
+
+func QuantityCheckForSingleLinePo(stub shim.ChaincodeStubInterface, invQty float64, poQty float64, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	myLogger.Debugf("Inside Quantity check =============>", invQty, poQty)
+	if invQty <= poQty {
+		myLogger.Debugf("QUANTITY CHECK PASSED")
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0607", EMPTY_ADDITIONAL_INFO)
+		STORE_INVOICE = true
+		SetInvoiceForProcessing(invoice)
+		return 1, errStr, invStat
+	}
+	myLogger.Debugf("QUANTITY CHECK FAILED")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_QTY, "", "ST0602", EMPTY_ADDITIONAL_INFO)
+	return 2, errStr, invStat
+
+}
+
+func MatchDescriptionForSingleLinePo(stub shim.ChaincodeStubInterface, invIdx int, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	var po po.PO
+	myLogger.Debugf("Inside Description check for SinglelinePO =============>")
+	poRec, _ := db.TableStruct{Stub: stub, TableName: "PO", PrimaryKeys: []string{invoice.PoNumber()}, Data: ""}.Get()
+	err := json.Unmarshal([]byte(poRec), &po)
+	if err != nil {
+		myLogger.Debugf("Error parsing Purchase Order in stage 06 SinglelinePO: ", err)
+		return 2, "Error parsing Purchase Order in stage 06 SinglelinePO", invStat
+	}
+
+	if len((*invoice.DcLines())[invIdx].Description()) == 0 {
+		myLogger.Debugf("LINE DESCRIPTION Blank in invoice--writing po line description and PoLineNumber to invoice")
+		(*invoice.DcLines())[invIdx].SetDescription((*po.LineItems())[0].LineItemDescription())
+		(*invoice.DcLines())[invIdx].SetPoLine((*po.LineItems())[0].PoLine())
+
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0607", EMPTY_ADDITIONAL_INFO)
+
+		STORE_INVOICE = true
+		SetInvoiceForProcessing(invoice)
+		return 1, errStr, invStat
+	} else {
+		myLogger.Debugf("Else Case for Single line item with description")
+		(*invoice.DcLines())[invIdx].SetPoLine((*po.LineItems())[0].PoLine())
+	}
+	myLogger.Debugf("LINE DESCRIPTION MATCHES for single Line PO---superseeding the description match")
+	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0607", EMPTY_ADDITIONAL_INFO)
+
+	STORE_INVOICE = true
+	SetInvoiceForProcessing(invoice)
+	return 1, errStr, invStat
+
+	/*	myLogger.Debugf("LINE DESCRIPTION DOESN'T MATCH for single Line PO")
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_DESC, "", "ST0608", EMPTY_ADDITIONAL_INFO)
+		return 2, errStr, invStat*/
+
+}
+
+func VerifyPricePerUnit(stub shim.ChaincodeStubInterface, invoice Invoice, isSingleLinePo bool) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	var po po.PO
+	poRec, _ := db.TableStruct{Stub: stub, TableName: "PO", PrimaryKeys: []string{invoice.PoNumber()}, Data: ""}.Get()
+	err := json.Unmarshal([]byte(poRec), &po)
+	if err != nil {
+		myLogger.Debugf("Error in parsing Purchase Order.")
+	}
+
+	if (*invoice.DcLines())[0].Quantity() == 1 {
+		if (*po.LineItems())[0].PoUnitNetPrice() == 1 {
+			myLogger.Debugf("LINE PRICE MATCHES")
+			// Next step
+			return MatchDescription(stub, invoice, isSingleLinePo)
+		} else {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_PRICE, "", "ST0605", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		}
+	} else {
+		if (*invoice.DcLines())[0].UnitPrice() == (*po.LineItems())[0].PoUnitNetPrice() {
+			myLogger.Debugf("LINE PRICE MATCHES")
+			// Next step
+			return MatchDescription(stub, invoice, isSingleLinePo)
+		} else {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_PRICE, "", "ST0605", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		}
+	}
+	return 2, errStr, invStat
+}
+
+func MatchDescription(stub shim.ChaincodeStubInterface, invoice Invoice, isSingleLinePo bool) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	var po po.PO
+	poRec, _ := db.TableStruct{Stub: stub, TableName: "PO", PrimaryKeys: []string{invoice.PoNumber()}, Data: ""}.Get()
+	err := json.Unmarshal([]byte(poRec), &po)
+	if err != nil {
+		myLogger.Debugf("Error parsing Purchase Order in stage 06: ", err)
+		return 2, "Error parsing Purchase Order in stage 06", invStat
+	}
+
+	// @TODO : Finalize the tolerence percentage
+	if isSingleLinePo {
+		if util.ProbableMatch((*invoice.DcLines())[0].Description(), (*po.LineItems())[0].LineItemDescription()) {
+			myLogger.Debugf("LINE DESCRIPTION MATCHES")
+			invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0607", EMPTY_ADDITIONAL_INFO)
+
+			STORE_INVOICE = true
+			SetInvoiceForProcessing(invoice)
+			return 1, errStr, invStat
+		}
+	}
+	myLogger.Debugf("LINE DESCRIPTION DOESN'T MATCH")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_LS_INCORRECT_DESC, "", "ST0608", EMPTY_ADDITIONAL_INFO)
+	return 2, errStr, invStat
+}
+
+func SelectLineItem_AP_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("IBM AP ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_AP_ACT_ACCEPTED {
+		UpdateInvoiceStatus(stub, invStat.BciId(), invStat.InvoiceNumber(), INV_STATUS_WAITING_INVOICE_FIX, invStat.ReasonCode(), invStat.Comments(), "ST0603", EMPTY_ADDITIONAL_INFO)
+		is, fetchErr := GetInvoiceStatus(stub, []string{invStat.BciId(), invStat.InvoiceNumber()})
+		if fetchErr != "" {
+			return 0, "Error while fetching invoice status in stage 06 AP action", invStat
+		}
+		myLogger.Debugf("IBM AP InternalStatus:", is[len(is)-1].InternalStatus)
+		myLogger.Debugf("", invStat.Status())
+		if is[len(is)-1].InternalStatus() == "ST0602" {
+			//return VerifyPricePerUnit(stub, invoice, true)
+			myLogger.Debugf("Supersede for Singleline Qty PO Post update")
+			invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, invStat.ReasonCode(), "", "ST0607", EMPTY_ADDITIONAL_INFO)
+			return 1, errStr, invStat
+		} else if is[len(is)-1].InternalStatus() == "ST0613" {
+			// return MatchDescription(stub, invoice, false)
+			myLogger.Debugf("Supersede for multiline Desc/Price PO Post update")
+			invStat = UpdateInvoiceStatus(stub, invStat.BciId(), invStat.InvoiceNumber(), INV_STATUS_PROCESSING, invStat.ReasonCode(), "", "ST0612", EMPTY_ADDITIONAL_INFO)
+			return 1, errStr, invStat
+		} else if is[len(is)-1].InternalStatus() == "ST0605" {
+			// return MatchDescription(stub, invoice, true)
+			myLogger.Debugf("Supersede for Singleline Price PO Post update")
+			invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, invStat.ReasonCode(), "", "ST0607", EMPTY_ADDITIONAL_INFO)
+			return 1, errStr, invStat
+		} else if is[len(is)-1].InternalStatus() == "ST0608" {
+			myLogger.Debugf("Supersede for Singleline Description PO Post update")
+			invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, invStat.ReasonCode(), "", "ST0607", EMPTY_ADDITIONAL_INFO)
+			return 1, errStr, invStat
+		}
+	} else if invStat.Status() == USR_AP_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0604", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.Status() == USR_AP_ACT_RETURN_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, invStat.ReasonCode(), invStat.Comments(), "ST0607A", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	} else if invStat.ReasonCode() == USR_BUYER_ACT_FORWARD_OTHERBUYER_ACCEPTED {
+
+		errStr, invStat = ForwardToOtherBuyer(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}
+
+func SelectLineItem_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		invStat = UpdateInvoiceStatus(stub, invStat.BciId(), invStat.InvoiceNumber(), INV_STATUS_PROCESSING, invStat.ReasonCode(), "", "ST0609", EMPTY_ADDITIONAL_INFO)
+		return 1, errStr, invStat
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0610", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.Status() == USR_BUYER_ACT_ALT_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_INVOICE_FIX, invStat.ReasonCode(), invStat.Comments(), "ST0001", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}

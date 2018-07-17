@@ -1,0 +1,123 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"strings"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/companyCode"
+	"github.com/ibm/p2p/po"
+)
+
+/*
+ 		Check PO is for the correct Company Code
+
+		The Bill To address on the invoice  need to match to the address of the company code taken from the Purchase Order table
+
+		Example:
+		Invoice shows  Bill To Address:  114 South Street, London and PO number 123456
+		From the PO table check that PO 123456 is associated with Company Code 012 and from the Company Code Table check if the Company Code 012 has an address of
+		114 South Street,  London
+
+		Therefore the two match
+		If the Bill To address on the invoice does not relate to the company code on the PO i.e. they do not match then the invoice should be "Rejected" with reason code "PO# does not match  Bill to Address"
+*/
+
+func MatchCompanyCode(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+
+	po, poFetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+	if poFetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	cc, ccFetchErr := companyCode.GetCompanyCode(stub, po.CompanyCode())
+	if ccFetchErr != "" {
+		return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	// Note : For BillToAddress we can only consider the name, as the other address field format may hav evariations
+	myLogger.Debugf("Bill To Address in invoice - ", invoice.BuyerName())
+	myLogger.Debugf("Bill To Address in CompanyCode  - ", cc.CompanyName())
+
+	companyName := strings.ToUpper(cc.CompanyName())
+
+	switch companyName {
+
+	case CONOPCO:
+
+		if util.ProbableMatch(CONOPCO, invoice.BuyerName()) || util.ProbableMatch(CONOPCO_INC, invoice.BuyerName()) {
+			myLogger.Debugf("ENTERED IF")
+			myLogger.Debugf("BILL TO ADDRESS MATCHES")
+			statusCode, errStr, invStat := successBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		} else {
+			myLogger.Debugf("ENTERED ELSE")
+			statusCode, errStr, invStat := failureBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		}
+
+		//Rest of the cases need clarification for possible buyer name matches
+	case UNILIVER_CANADA_INC:
+		if util.ProbableMatch(UNILIVER_CANADA_INC, invoice.BuyerName()) || util.ProbableMatch(UNILIVER_CANADA_INC, invoice.BuyerName()) {
+			statusCode, errStr, invStat := successBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		} else {
+			statusCode, errStr, invStat := failureBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		}
+
+	case UNILEVER_MANUFACTURNG:
+		if util.ProbableMatch(UNILEVER_MANUFACTURNG, invoice.BuyerName()) || util.ProbableMatch(UNILEVER_MANUFACTURNG, invoice.BuyerName()) {
+			statusCode, errStr, invStat := successBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		} else {
+			statusCode, errStr, invStat := failureBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		}
+	default:
+
+		if util.ProbableMatch(cc.CompanyName(), invoice.BuyerName()) {
+			myLogger.Debugf("BILL TO ADDRESS MATCHES")
+			statusCode, errStr, invStat := successBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		} else {
+			statusCode, errStr, invStat := failureBTA(stub, invoice)
+			return statusCode, errStr, invStat
+		}
+	}
+
+}
+
+func successBTA(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BILL TO ADDRESS MATCHES")
+	invStat := UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST01001", EMPTY_ADDITIONAL_INFO)
+	return 1, "", invStat
+}
+
+func failureBTA(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BILL TO ADDRESS DOESN'T MATCH - INVOICE REJECTED")
+	invStat, errStr := SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO_BILLTOADDR, "", "ST0202", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	return 2, errStr, invStat
+}
+
+//Removed as per requirement
+
+/*
+	if util.ProbableMatch(cc.CompanyName, invoice.BuyerName()) {
+		myLogger.Debugf("BILL TO ADDRESS MATCHES")
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST01001", EMPTY_ADDITIONAL_INFO)
+		return 1, "", invStat
+	}*/
+/*	myLogger.Debugf("BILL TO ADDRESS DOESN'T MATCH - INVOICE REJECTED")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO_BILLTOADDR, "", "ST0202", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	return 2, errStr, invStat*/

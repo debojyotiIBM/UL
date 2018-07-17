@@ -1,0 +1,107 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"strings"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/po"
+	reftable "github.com/ibm/p2p/refTable"
+	"github.com/ibm/p2p/vmd"
+)
+
+/*
+ 		Vendor ID/Name match between the Invoice & PO
+    1. The Vendor Id on the purchase order will need to be matched with the vendor submitting the invoice to ensure that the PO number quoted on
+			the invoice is for this vendor.
+    2. If the do not match then check if the PO vendor country is same as the Inv vendor country and if its same then check if the POVendorName and
+        the Inv vendor name contains IBM / International Business Machines.
+
+*/
+
+func MatchVendorId(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+
+	po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(), invoice.ErpSystem()})
+	if fetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 01", invStat
+	}
+	myLogger.Debugf("Vendor ID in invoice - ", invoice.VendorID())
+	myLogger.Debugf("Vendor ID in PO - ", po.VendorID())
+
+	POVendorDetails, err := vmd.GetVendor(stub, po.ERPSystem(), po.VendorID())
+	InvVendorDetails, err1 := vmd.GetVendor(stub, invoice.ErpSystem(), invoice.VendorID())
+
+	if err == "" && err1 == "" {
+		if invoice.VendorID() == po.VendorID() {
+			vendor_Name := POVendorDetails.VendorName()
+			if strings.Contains(vendor_Name, "IBM") || strings.Contains(vendor_Name, "International Business Machines") {
+				myLogger.Debugf("Entered success loop=====Vendor ID is same in Po and Invoice=========")
+				statusCode, errStr, invStat := success(stub, invoice)
+				dueDate := reftable.CalculateDueDate(stub, *invoice.ScanDate(), *invoice.DocDate(),
+					invoice.VendorID(), InvVendorDetails.ErpSystem(), po.PaymentTerms())
+				invoice.SetDueDate(dueDate)
+				STORE_INVOICE = true
+				SetInvoiceForProcessing(invoice)
+				return statusCode, errStr, invStat
+			} else {
+				myLogger.Debugf("Entered failure loop=====Vendor ID is same in Po and Invoice=========")
+				statusCode, errStr, invStat := failure(stub, invoice)
+				return statusCode, errStr, invStat
+			}
+		} else {
+			PoAddrTokens := strings.Split(POVendorDetails.VendorAddress(), "|")
+			InvAddrTokens := strings.Split(InvVendorDetails.VendorAddress(), "|")
+			if util.ProbableMatch(InvAddrTokens[3], PoAddrTokens[3]) {
+				poVendor_Name := POVendorDetails.VendorName1()
+				invVendor_Name := InvVendorDetails.VendorName1()
+				if (strings.Contains(poVendor_Name, "IBM") || strings.Contains(poVendor_Name, "International Business Machines")) && (strings.Contains(invVendor_Name, "IBM") || strings.Contains(invVendor_Name, "International Business Machines")) {
+					myLogger.Debugf("Entered success loop=====Vendor ID is different in Po and Invoice=========")
+					statusCode, errStr, invStat := success(stub, invoice)
+					dueDate := reftable.CalculateDueDate(stub, *invoice.ScanDate(), *invoice.DocDate(), invoice.VendorID(), invoice.ErpSystem(), po.PaymentTerms())
+					invoice.SetDueDate(dueDate)
+					STORE_INVOICE = true
+					SetInvoiceForProcessing(invoice)
+					return statusCode, errStr, invStat
+
+				} else {
+					myLogger.Debugf("Entered failure loop=====Vendor name doesnt contain IBM in Po and Invoice=========")
+					statusCode, errStr, invStat := failure(stub, invoice)
+					return statusCode, errStr, invStat
+				}
+
+			} else {
+				myLogger.Debugf("Entered failure loop=====Countries doesnt match in PO and Vendor=========")
+				statusCode, errStr, invStat := failure(stub, invoice)
+				return statusCode, errStr, invStat
+			}
+		}
+
+	} else {
+		myLogger.Debugf("Entered failure loop=====PO or Invoice vendor Not found=========")
+		statusCode, errStr, invStat := failure(stub, invoice)
+		return statusCode, errStr, invStat
+	}
+
+}
+
+func success(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	myLogger.Debugf("VENDOR NAME MATCHES")
+	invStat := UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0101", EMPTY_ADDITIONAL_INFO)
+	return 1, "", invStat
+}
+
+func failure(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	myLogger.Debugf("VENDOR NAME DOESN'T MATCH - INVOICE REJECTED")
+	invStat, errStr := SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO_VENDOR, "", "ST0102", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	return 2, errStr, invStat
+}

@@ -1,0 +1,185 @@
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/po"
+	//"strconv"
+	//"math"
+)
+
+func PoBudget(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	var invoiceTotalPrice float64
+
+	po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+	if fetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+	}
+
+	myLogger.Debugf("po in MatchPricePerUnit", po)
+
+	totalPoBudget := GetResidualPOBudget(po)
+
+	myLogger.Debugf("Total PO budget", totalPoBudget)
+
+	for idx, invoiceLine := range *invoice.DcLines() {
+
+		invPrice := 0.0
+		invquantity := 0.0
+		/*if util.GetFloatFromString(invoiceLine.Quantity) == 1 {
+						invquantity = util.GetFloatFromString(invoiceLine.Unit_Price)
+						invPrice = util.GetFloatFromString(invoiceLine.Quantity)
+				}else{
+						invquantity = util.GetFloatFromString(invoiceLine.Quantity)
+						invPrice = util.GetFloatFromString(invoiceLine.Unit_Price)
+				}
+
+		myLogger.Debugf("Quantity and Price from invoice",invquantity,invPrice)*/
+
+		for _, poLine := range *po.LineItems() {
+
+			myLogger.Debugf("invoiceLine.POLine===============", invoiceLine.PoLine())
+			myLogger.Debugf("poLine.LineItemNumber===============", poLine.PoLine())
+			if invoiceLine.PoLine() == poLine.PoLine() {
+
+				poUnitPrice := poLine.PoUnitNetPrice()
+
+				if poUnitPrice == 1 {
+					myLogger.Debugf("PO UnitPrice one for PO Budget new change=======>", poUnitPrice)
+					invquantity = invoiceLine.UnitPrice()
+					invPrice = invoiceLine.Quantity()
+				} else {
+					myLogger.Debugf("PO UnitPrice more than one for PO Budget new change=======>", poUnitPrice)
+					invquantity = invoiceLine.Quantity()
+					invPrice = invoiceLine.UnitPrice()
+				}
+				myLogger.Debugf("Quantity and Price from invoice for PO Budget new change=======>", invquantity, invPrice)
+
+				//	priceDecider := math.Min(poUnitPrice,invPrice)
+
+				priceDecider := poUnitPrice
+
+				finalPrice := priceDecider * invquantity
+
+				invoiceLine.SetFinalPrice(util.GetStringFromFloat(finalPrice))
+				(*invoice.DcLines())[idx].SetFinalPrice(invoiceLine.FinalPrice())
+				myLogger.Debugf("Final Price of each line item", invoiceLine.FinalPrice())
+
+				invoiceTotalPrice = invoiceTotalPrice + util.GetFloatFromString(invoiceLine.FinalPrice())
+				myLogger.Debugf("Invoice total price of each line item", invoiceTotalPrice)
+
+			}
+		}
+
+	}
+
+	myLogger.Debugf("Invoice final total price", invoiceTotalPrice)
+	invoice.SetRevisedTotalAmount(invoiceTotalPrice)
+	myLogger.Debugf("Revised total amount", invoice.RevisedTotalAmount())
+	myLogger.Debugf("invoice in po budget============", invoice)
+	SetInvoiceForProcessing(invoice)
+	STORE_INVOICE = true
+
+	if invoiceTotalPrice <= totalPoBudget {
+		UpdateResidualPOBudget(po, invoiceTotalPrice)
+		myLogger.Debugf("Updated PO Residual amount after Budget consumption-- ", GetResidualPOBudget(po))
+		StorePOResiduals(stub)
+		//	PoBudgetRevert(stub,invoice)
+
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0601A", EMPTY_ADDITIONAL_INFO)
+		myLogger.Debugf("PO IS ACTIVE AND INVOICE AMOUNT IS WITHIN PO BUDGET")
+		return 1, errStr, invStat
+	}
+
+	myLogger.Debugf("PO IS ACTIVE BUT INVOICE AMOUNT IS EXCEEDING PO BUDGET")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_INVALID_PO_BUDGET, "", "ST0602A", EMPTY_ADDITIONAL_INFO)
+	return 2, errStr, invStat
+
+}
+
+/*
+func FloatToString(input_num float64) string {
+    // to convert a float number to a string
+    return strconv.FormatFloat(input_num, 'f', -1, 64)
+}*/
+
+//PO Residual revert  logic
+
+/*func PoBudgetRevert(stub shim.ChaincodeStubInterface,invoice Invoice) (int, string, InvoiceStatus){
+var invStat InvoiceStatus
+  var errStr string
+	po,fetchErr := po.GetPO(stub, []string{invoice.PoNumber()})
+	if fetchErr != ""{
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 01", invStat
+	}
+
+	totalPoBudget := GetResidualPOBudget(po)
+	revertBudget := totalPoBudget + invoice.RevisedTotalAmount()
+	UpdateResidualPOBudget(po,util.GetFloatFromString(revertBudget))
+	StorePOResiduals(stub)
+	return 2, errStr, invStat
+}*/
+
+func PoBudget_AP_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("IBM AP ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_AP_ACT_PENDING_VMD {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_VMD, INV_RS_PENDING_VMD_UPDATE, invStat.Comments(), "ST0603A", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_RETURN_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, invStat.ReasonCode(), invStat.Comments(), "ST0604A", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0605A", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}
+
+func PoBudget_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_UNBLOCK_PO {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_PO_REFRESH, invStat.ReasonCode(), invStat.Comments(), "ST0606A", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_BUYER_ACT_ALT_PO {
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_INVOICE_FIX, invStat.ReasonCode(), invStat.Comments(), "ST0001", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0608A", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+
+	} else if invStat.Status() == USR_BUYER_ACT_RETURN {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, invStat.ReasonCode(), invStat.Comments(), "ST0609A", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}

@@ -1,0 +1,36 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	"github.com/ibm/db"
+	util "github.com/ibm/p2p"
+)
+
+/*
+	Duplicate Invoice Check
+*/
+
+func VerifyDuplicate(stub shim.ChaincodeStubInterface, invoice Invoice, remitToId string) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+
+	//change for Duplicate invoce Doc date has removed from Primary key while quering
+	invRec, _ := db.TableStruct{Stub: stub, TableName: util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), util.GetStringFromFloat(invoice.TotalAmount()), remitToId}, Data: ""}.Get()
+
+	if invRec != "" {
+		myLogger.Debugf("DUPLICATE FOUND")
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_DUPLICATE_INV, "", "ST0502", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+	}
+
+	myLogger.Debugf("DUPLICATE NOT FOUND")
+	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST01201", EMPTY_ADDITIONAL_INFO)
+	return 1, errStr, invStat
+
+}

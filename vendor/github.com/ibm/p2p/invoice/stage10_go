@@ -1,0 +1,91 @@
+/*
+Copyright IBM Corp. 2017 All Rights Reserved.
+Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+@author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	// "github.com/ibm/db"
+
+	"github.com/ibm/p2p/companyCode"
+	"github.com/ibm/p2p/po"
+)
+
+/*
+	Tax Handling
+*/
+
+func VerifyTax(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+
+	var invStat InvoiceStatus
+	var errStr string
+	//Country := invoice.TaxReportingCountry() // US
+
+	po, poFetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+	if poFetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	cc, ccFetchErr := companyCode.GetCompanyCode(stub, po.CompanyCode())
+	if ccFetchErr != "" {
+		return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	//myLogger.Debugf("Country from invoice============",Country);
+	myLogger.Debugf("Entered tax validation===================", cc.Country())
+	//if (util.ProbableMatch(cc.Country(), InvAddrTokens[3]) && InvAddrTokens[3] == "US") {
+	if cc.Country() == "US" {
+		//if InvAddrTokens[3] == "US"	{
+		//	if Country == "US" {
+		myLogger.Debugf("Entered US loop")
+		if invoice.TaxAmount() == 0.0 {
+			invoice.SetTaxCode("I0")
+		} else {
+			myLogger.Debugf("================entered else part of tax code==============")
+			invoice.SetTaxCode("V0")
+		}
+
+	} else if cc.Country() == "CA" {
+
+		if invoice.TaxAmount() == 0.0 {
+
+			invoice.SetTaxCode("P0")
+		} else {
+			if invoice.TaxAmount() == ((invoice.TotalNet() * 5) / 100) {
+
+				invoice.SetTaxCode("P1")
+			} else if invoice.TaxAmount() == ((invoice.TotalNet() * 13) / 100) {
+
+				invoice.SetTaxCode("P2")
+			} else {
+				myLogger.Debugf("TAX MISMATCH - INVOICE REJECTED")
+				invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_TAX_INCORRECT, "", "ST01002", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+				return 2, errStr, invStat
+			}
+		}
+	}
+	myLogger.Debugf("Tax_Code==========", invoice.TaxCode())
+	myLogger.Debugf("invoice in tax code============", invoice)
+	SetInvoiceForProcessing(invoice)
+	myLogger.Debugf("TAX VERIFIED")
+	STORE_INVOICE = true
+	//invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSED, INV_RS_TAX_CORRECT, "", "ST01001", EMPTY_ADDITIONAL_INFO)
+
+	invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, INV_RS_TAX_CORRECT, "", "ST0201", EMPTY_ADDITIONAL_INFO)
+
+	/* POST INVOICE PASS THROUGH, UPDATE FOLLOWING
+	   1. DUPLICATE TABLE
+	   2. UPDATE INVOICE STATUS HISTORY
+	   3. UPDATE PO RESIDUALS
+	*/
+	/*db.TableStruct{Stub: stub, TableName:util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), invoice.TotalAmount(), VENDOR_ID}, Data: ""}.Add()
+	  StoreInvoiceStatusHistory(stub, invoice.BCIID(), invoice.InvoiceNumber(), INV_STATUS_PROCESSED)
+	  StorePOResiduals(stub)
+	  StoreGRNResiduals(stub)*/
+	return 1, errStr, invStat
+}

@@ -1,0 +1,733 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+package invoice
+
+import (
+	"math/rand"
+	"sort"
+	"time"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	gr "github.com/ibm/p2p/grn"
+	"github.com/ibm/p2p/po"
+)
+
+type timeSlice []time.Time
+
+func (s timeSlice) Less(i, j int) bool { return s[i].Before(s[j]) }
+func (s timeSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s timeSlice) Len() int           { return len(s) }
+
+var BOL_NO_MATCH_PROBABLE_GRN bool
+var UPDATED_INVOICE Invoice
+
+/*
+   GRN Quatity Match
+*/
+func MatchQuantityWithGRN(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	BOL_NO_MATCH_PROBABLE_GRN = false
+	UPDATED_INVOICE = invoice
+	//	var FINAL_INVOICE Invoice
+	var invStat InvoiceStatus
+	var errStr string
+
+	var linesInfo string
+	var MERGE_COMMAND = false
+	var po_num = invoice.PoNumber()
+	var inv_number = invoice.InvoiceNumber()
+	for _, line := range *invoice.DcLines() {
+		var po_line = line.PoLine()
+
+		candidates_after_PO_LI_filter, _ := gr.GetGrnsByPoAndLineItemNumber(stub, po_num, po_line)
+		myLogger.Debugf("candidates_after_PO_LI_filter========", candidates_after_PO_LI_filter)
+		if len(candidates_after_PO_LI_filter) == 0 {
+			continue
+		}
+		candidates_after_BOL_filter, _ := filterGrnsByBOL(stub, candidates_after_PO_LI_filter, invoice.InvoiceNumber(), line.DeliveryNote(), invoice.BCIID())
+		myLogger.Debugf("len candidates_after_BOL_filter===========", len(candidates_after_BOL_filter))
+		myLogger.Debugf("candidates_after_BOL_filter===========", candidates_after_BOL_filter)
+		if len(candidates_after_BOL_filter) == 0 {
+			myLogger.Debugf("Entered candidates_after_BOL_filter zero loop==================")
+			continue
+		}
+
+		myLogger.Debugf("loop skipped========================")
+
+		candidates_after_date_filter := filterGrnsOnDate(invoice, candidates_after_PO_LI_filter)
+		if len(candidates_after_date_filter) == 0 {
+			continue
+		}
+
+		MERGE_COMMAND = true
+		break
+
+	}
+
+	if MERGE_COMMAND == false {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_WAITING_FOR_GRN, INV_RS_GRN_INV_HOLD, "", "ST0909", CreateAdditionalInfo("INVOICE LINES MISSING GRN", linesInfo))
+		return 2, errStr, invStat
+	}
+
+	GroupInvoiceLineItems(stub)
+	//type li_number_counter int64
+	var li_number_counter int64 = 1
+	var invoiceLines []DCLine
+	//var invoiceLine DCLine
+	//var linesInfo string
+	var GRN_absent = false
+	for _, line := range *UPDATED_INVOICE.DcLines() {
+		var emptyGRNMatch = *line.GrnMatch()
+		var po_line = line.PoLine()
+		var grnMatch []gr.GRN
+
+		candidates_after_PO_LI_filter, _ := gr.GetGrnsByPoAndLineItemNumber(stub, po_num, po_line)
+		myLogger.Debugf("candidates_after_PO_LI_filter with PO=", po_num, ", po_line=", po_line, " || >", candidates_after_PO_LI_filter)
+		if len(candidates_after_PO_LI_filter) == 0 {
+			line.SetInvoiceLine(li_number_counter)
+			invoiceLines = append(invoiceLines, line)
+			li_number_counter = li_number_counter + 1
+
+			if linesInfo != "" {
+				linesInfo = linesInfo + "and"
+			}
+			linesInfo = linesInfo + util.GetStringFromInt(line.InvoiceLine())
+			GRN_absent = true
+			continue
+		}
+		candidates_after_BOL_filter, _ := filterGrnsByBOL(stub, candidates_after_PO_LI_filter, invoice.InvoiceNumber(), line.DeliveryNote(), invoice.BCIID())
+		if len(candidates_after_BOL_filter) == 0 {
+			line.SetInvoiceLine(li_number_counter)
+			invoiceLines = append(invoiceLines, line)
+			li_number_counter = li_number_counter + 1
+
+			if linesInfo != "" {
+				linesInfo = linesInfo + "and"
+			}
+			linesInfo = linesInfo + util.GetStringFromInt(line.InvoiceLine())
+			GRN_absent = true
+			continue
+		}
+
+		candidates_after_date_filter := filterGrnsOnDate(invoice, candidates_after_BOL_filter)
+		if len(candidates_after_date_filter) == 0 {
+			line.SetInvoiceLine(li_number_counter)
+			invoiceLines = append(invoiceLines, line)
+			li_number_counter = li_number_counter + 1
+
+			if linesInfo != "" {
+				linesInfo = linesInfo + "and"
+			}
+			linesInfo = linesInfo + util.GetStringFromInt(line.InvoiceLine())
+			GRN_absent = true
+			continue
+		}
+		/*Got the Candidate GRNs, now match with or w/o splitting invoice.*/
+
+		for len(candidates_after_date_filter) > 0 {
+			fifoGrn := GetFIFOGrn(candidates_after_date_filter)
+			myLogger.Debugf("FIFO GRN: ", string(util.MarshalToBytes(fifoGrn)))
+			myLogger.Debugf("Invoice Line : ", string(util.MarshalToBytes(line)))
+			// Swap the quantity and amount
+			if line.Quantity() == 1 { //need to be corrected
+				if GetUpdatedResidualGRNQty(fifoGrn) >= line.UnitPrice() {
+					//UpdateGrnResidualQty(fifoGrn, line.Unit_Price)
+
+					line.SetInvoiceLine(li_number_counter)
+					myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled>>>>>>>>>>>>>>>>>>>")
+					UpdateGrnResidualQty(stub, fifoGrn, line.UnitPrice(), inv_number, line.InvoiceLine())
+					//	 line.GRNMatch = append(line.GRNMatch,fifoGrn)
+					grnMatch = *line.GrnMatch()
+					grnMatch = append(grnMatch, fifoGrn)
+					line.SetGrnMatch(grnMatch)
+					invoiceLines = append(invoiceLines, line)
+					li_number_counter = li_number_counter + 1
+					break
+				} else {
+					/*
+					   Split_LI_Invoice_according to grn. Add a new LI in the final_invoice
+					   li_number_counter++
+					*/
+					var residualQty_inGRN = GetUpdatedResidualGRNQty(fifoGrn)
+					var line_qty_afterSplit = line.UnitPrice() - residualQty_inGRN
+					line.SetInvoiceLine(li_number_counter)
+					line.SetUnitPrice(residualQty_inGRN)
+					line.SetAmount(line.UnitPrice() * line.Quantity())
+					// line.GRNMatch = append(emptyGRNMatch, fifoGrn)
+					grnMatch = *line.GrnMatch()
+					grnMatch = append(emptyGRNMatch, fifoGrn)
+					line.SetGrnMatch(grnMatch)
+					invoiceLines = append(invoiceLines, line)
+					li_number_counter = li_number_counter + 1
+					myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled>>>>>>>>>>>>>>>>>>>")
+					UpdateGrnResidualQty(stub, fifoGrn, line.UnitPrice(), inv_number, line.InvoiceLine())
+
+					line.SetUnitPrice(line_qty_afterSplit)
+					line.SetAmount(line.UnitPrice() * line.Quantity())
+
+					line.SetGrnMatch(emptyGRNMatch)
+
+					//Pop out this GRN
+					candidates_after_date_filter = popOutVerifiedGRN(candidates_after_date_filter, fifoGrn)
+					if len(candidates_after_date_filter) == 0 {
+						line.SetInvoiceLine(li_number_counter)
+						invoiceLines = append(invoiceLines, line)
+						li_number_counter = li_number_counter + 1
+
+						if linesInfo != "" {
+							linesInfo = linesInfo + "and"
+						}
+						linesInfo = linesInfo + util.GetStringFromInt(line.InvoiceLine())
+						GRN_absent = true
+					}
+				}
+			} else {
+
+				//check here
+				if GetUpdatedResidualGRNQty(fifoGrn) >= line.Quantity() {
+					//UpdateGrnResidualQty(fifoGrn, line.Quantity)
+
+					line.SetInvoiceLine(li_number_counter)
+					myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled2>>>>>>>>>>>>>>>>>>>")
+					UpdateGrnResidualQty(stub, fifoGrn, line.Quantity(), inv_number, line.InvoiceLine())
+					// line.GRNMatch = append(line.GRNMatch,fifoGrn)
+					grnMatch = *line.GrnMatch()
+					grnMatch = append(grnMatch, fifoGrn)
+					line.SetGrnMatch(grnMatch)
+					invoiceLines = append(invoiceLines, line)
+					li_number_counter = li_number_counter + 1
+					break
+				} else {
+					/*
+					   Split_LI_Invoice_according to grn. Add a new LI in the final_invoice
+					   li_number_counter++
+					*/
+					var residualQty_inGRN = GetUpdatedResidualGRNQty(fifoGrn)
+					var line_qty_afterSplit = line.Quantity() - residualQty_inGRN
+					line.SetInvoiceLine(li_number_counter)
+					line.SetQuantity(residualQty_inGRN)
+					line.SetAmount(line.UnitPrice() * line.Quantity())
+					// line.GRNMatch = append(emptyGRNMatch, fifoGrn)
+					grnMatch = *line.GrnMatch()
+					grnMatch = append(emptyGRNMatch, fifoGrn)
+					line.SetGrnMatch(grnMatch)
+					invoiceLines = append(invoiceLines, line)
+					li_number_counter = li_number_counter + 1
+					myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled>>>>>>>>>>>>>>>>>>>")
+					//	 UpdateGrnResidualQty(fifoGrn, line.Unit_Price, inv_number, line.Invoice_Line)
+					UpdateGrnResidualQty(stub, fifoGrn, line.Quantity(), inv_number, line.InvoiceLine())
+
+					line.SetQuantity(line_qty_afterSplit)
+					line.SetAmount(line.UnitPrice() * line.Quantity())
+					//line.GRNMatch = emptyGRNMatch
+					line.SetGrnMatch(emptyGRNMatch)
+					//Pop out this GRN
+					candidates_after_date_filter = popOutVerifiedGRN(candidates_after_date_filter, fifoGrn)
+					if len(candidates_after_date_filter) == 0 {
+						line.SetInvoiceLine(li_number_counter)
+						invoiceLines = append(invoiceLines, line)
+						li_number_counter = li_number_counter + 1
+
+						if linesInfo != "" {
+							linesInfo = linesInfo + "and"
+						}
+						linesInfo = linesInfo + util.GetStringFromInt(line.InvoiceLine())
+						GRN_absent = true
+					}
+				}
+			}
+
+		}
+
+	}
+
+	UPDATED_INVOICE.SetDcLines(invoiceLines)
+
+	SetInvoiceForProcessing(UPDATED_INVOICE)
+	STORE_INVOICE = true
+
+	if GRN_absent == false {
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0901", EMPTY_ADDITIONAL_INFO)
+		return 1, errStr, invStat
+	}
+
+	if GRN_absent == true {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_WAITING_FOR_GRN, INV_RS_GRN_INV_HOLD, "", "ST0909", CreateAdditionalInfo("INVOICE LINES MISSING GRN", linesInfo))
+		return 2, errStr, invStat
+	}
+
+	return 0, errStr, invStat
+
+}
+
+func filterGrnsByBOL(stub shim.ChaincodeStubInterface, grns []gr.GRN, invoice_number string, delivery_note string, bciId string) ([]gr.GRN, string) {
+	var candidateGrnsWithBOLMatch []gr.GRN
+	var GRNsWithBOL []gr.GRN
+	var GRNsWithoutBOL []gr.GRN
+	if len(grns) > 0 {
+		for _, g := range grns {
+			if GetUpdatedResidualGRNQty(g) > 0 {
+				myLogger.Debugf("Included check for Residual qty of GRN is >0 in BOL check============")
+				myLogger.Debugf("Residual qty of GRN is >0 ", GetUpdatedResidualGRNQty(g))
+				if g.BillOfLading() != "" && g.BillOfLading() != " " {
+					isCandidateGRN := false
+					myLogger.Debugf("By Invoice number : ", invoice_number)
+					grnsByInvNum, _ := gr.GetGRNs(stub, []string{g.ErpSystem(), invoice_number})
+					isCandidateGRN = ContainsGRN(grnsByInvNum, g)
+
+					if !isCandidateGRN {
+						myLogger.Debugf("By Delivery note  : ", delivery_note)
+						grnsByDelNote, _ := gr.GetGRNs(stub, []string{g.ErpSystem(), delivery_note})
+						isCandidateGRN = ContainsGRN(grnsByDelNote, g)
+					}
+
+					if !isCandidateGRN {
+						myLogger.Debugf("By Scan id ", bciId)
+						grnsByBciId, _ := gr.GetGRNs(stub, []string{g.ErpSystem(), bciId})
+						isCandidateGRN = ContainsGRN(grnsByBciId, g)
+					}
+
+					if isCandidateGRN {
+						GRNsWithBOL = append(GRNsWithBOL, g)
+					}
+				} else {
+					GRNsWithoutBOL = append(GRNsWithoutBOL, g)
+				}
+			}
+		}
+		myLogger.Debugf("GRNs with BOL ===========", GRNsWithBOL)
+		myLogger.Debugf("GRNs without BOL ===========", GRNsWithoutBOL)
+
+		for _, g1 := range GRNsWithBOL {
+			candidateGrnsWithBOLMatch = append(candidateGrnsWithBOLMatch, g1)
+		}
+		myLogger.Debugf("After appending GRNs with BOL==============", candidateGrnsWithBOLMatch)
+		for _, g2 := range GRNsWithoutBOL {
+			candidateGrnsWithBOLMatch = append(candidateGrnsWithBOLMatch, g2)
+		}
+		myLogger.Debugf("After appending GRNs without BOL==============", candidateGrnsWithBOLMatch)
+	}
+	myLogger.Debugf("selected GRN's==============", candidateGrnsWithBOLMatch)
+	return candidateGrnsWithBOLMatch, ""
+}
+
+func MatchPoLineItem(stub shim.ChaincodeStubInterface, invoice Invoice, line DCLine) int {
+	var candidateGrnsWithBOLMatch []gr.GRN
+	var candidateGrnsWithBOLMisMatch []gr.GRN
+	candidateGrnsWithPoMatch, _ := gr.GetGrnsByPoAndLineItemNumber(stub, invoice.PoNumber(), line.PoLine())
+
+	myLogger.Debugf("candidateGrnsWithPoMatch : ", candidateGrnsWithPoMatch)
+	if len(candidateGrnsWithPoMatch) == 0 {
+		//No Candidate GRNs after PO, LI filter
+		return 1
+	}
+
+	for _, g := range candidateGrnsWithPoMatch {
+		if g.BillOfLading() != "" {
+			isCandidateGRN := false
+			myLogger.Debugf("By Invoice number : ", invoice.InvoiceNumber())
+			grnsByInvNum, _ := gr.GetGRNs(stub, []string{g.ErpSystem(), invoice.InvoiceNumber()})
+			isCandidateGRN = ContainsGRN(grnsByInvNum, g)
+
+			if !isCandidateGRN {
+				myLogger.Debugf("By Delivery note  : ", line.DeliveryNote())
+				grnsByDelNote, _ := gr.GetGRNs(stub, []string{g.ErpSystem(), line.DeliveryNote()})
+				isCandidateGRN = ContainsGRN(grnsByDelNote, g)
+			}
+
+			if !isCandidateGRN {
+				myLogger.Debugf("By Scan id ", invoice.BCIID())
+				grnsByBciId, _ := gr.GetGRNs(stub, []string{g.ErpSystem(), invoice.BCIID()})
+				isCandidateGRN = ContainsGRN(grnsByBciId, g)
+			}
+
+			if isCandidateGRN {
+				candidateGrnsWithBOLMatch = append(candidateGrnsWithBOLMatch, g)
+			} else {
+				candidateGrnsWithBOLMisMatch = append(candidateGrnsWithBOLMisMatch, g)
+			}
+		}
+		candidateGrnsWithBOLMatch = append(candidateGrnsWithBOLMatch, g)
+	}
+
+	myLogger.Debugf("candidateGrns : ", candidateGrnsWithBOLMatch)
+	//myLogger.Debugf("candidateGrnsWithBOLMisMatch : ", candidateGrnsWithBOLMisMatch)
+	//	myLogger.Debugf("candidateGrnsWithoutBOL : ", candidateGrnsWithoutBOL)
+	//var newCandidateGrns []gr.GRN
+	if len(candidateGrnsWithBOLMatch) > 0 {
+		myLogger.Debugf("candidateGrnsWithBOLMatch : ", candidateGrnsWithBOLMatch)
+		return processAfterCandidateGrnsFound(stub, invoice, line, candidateGrnsWithBOLMatch)
+	} else {
+		//No Candidate GRNs after PO, LI, BOL filter
+		return 1
+	}
+	return 2
+}
+
+func ContainsGRN(grns []gr.GRN, grn gr.GRN) bool {
+	myLogger.Debugf("Grn ---- > ", string(util.MarshalToBytes(grn)))
+	if len(grns) > 0 {
+		for _, g := range grns {
+			myLogger.Debugf("g ---- > ", string(util.MarshalToBytes(g)))
+			if g.GrnNumber() == grn.GrnNumber() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func processAfterCandidateGrnsFound(stub shim.ChaincodeStubInterface, invoice Invoice, line DCLine, candidateGrns []gr.GRN) int {
+	candidateGrnsOnDate := filterGrnsOnDate(invoice, candidateGrns)
+	if len(candidateGrnsOnDate) == 0 {
+		// NO Candidate GRN's after PO, LI, BOL, Date Filter
+		return 1
+	}
+	var grnMatch []gr.GRN
+	for len(candidateGrnsOnDate) > 0 {
+		fifoGrn := GetFIFOGrn(candidateGrnsOnDate)
+		myLogger.Debugf("FIFO GRN: ", string(util.MarshalToBytes(fifoGrn)))
+		myLogger.Debugf("Invoice Line : ", string(util.MarshalToBytes(line)))
+		// Swap the quantity and amount
+
+		if GetUpdatedResidualGRNQty(fifoGrn) >= line.Amount() {
+			myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled3>>>>>>>>>>>>>>>>>>>")
+			UpdateGrnResidualQty(stub, fifoGrn, line.Amount(), "", 0)
+			for idx, invLine := range *invoice.DcLines() {
+				if invLine.InvoiceLine() == line.InvoiceLine() {
+
+					grnMatch = *((*invoice.DcLines())[idx].GrnMatch())
+					grnMatch = append(grnMatch, fifoGrn)
+					(*invoice.DcLines())[idx].SetGrnMatch(grnMatch)
+				}
+			}
+			SetInvoiceForProcessing(invoice)
+			STORE_INVOICE = true
+			return 0
+		}
+		candidateGrnsOnDate = popOutVerifiedGRN(candidateGrnsOnDate, fifoGrn)
+	}
+	return 2
+}
+
+func popOutVerifiedGRN(grns []gr.GRN, grn gr.GRN) []gr.GRN {
+	var remainingGRNS []gr.GRN
+	for _, g := range grns {
+		if !(g.GrnNumber() == grn.GrnNumber()) {
+			remainingGRNS = append(remainingGRNS, g)
+		}
+	}
+	return remainingGRNS
+}
+
+func filterGrnsOnDate(invoice Invoice, grns []gr.GRN) []gr.GRN {
+	layout := "02/01/2006"
+	//layout_invoice := "02-01-2006"
+	var candidateGrns []gr.GRN
+
+	for _, grn := range grns {
+		var grnLineItem []gr.GRNLineItem
+		myLogger.Debugf("GRN in date 01 ", grn)
+		// @TODO check date condition. check if it's empty
+		deliveryDate, _ := time.Parse(layout, grn.DeliveryDate())
+		myLogger.Debugf("GRN in date 01 deliveryDate ", deliveryDate)
+		invDate := invoice.DocDate().Time()
+		myLogger.Debugf("Invoice date 01 ", invDate)
+
+		marginDate := invDate.AddDate(0, 0, -6)
+		myLogger.Debugf("Margin date 01 ", marginDate)
+
+		grnLineItem = *grn.LineItems()
+
+		if deliveryDate.After(marginDate) && grnLineItem[0].ResidualQuantity() >= 0 {
+			candidateGrns = append(candidateGrns, grn)
+		}
+	}
+	myLogger.Debugf("GRN in date 02 candidateGrns ", candidateGrns)
+	return candidateGrns
+}
+
+func GetFIFOGrn(grnList []gr.GRN) gr.GRN {
+
+	var GRNsWithBOL []gr.GRN
+	var GRNsWithoutBOL []gr.GRN
+	var dateSlice timeSlice = []time.Time{}
+	var dateSlice1 timeSlice = []time.Time{}
+	layout := "02/01/2006"
+	for _, g := range grnList {
+		if g.BillOfLading() != "" && g.BillOfLading() != " " {
+			myLogger.Debugf("Entered BOL condition", g.BillOfLading(), g.DeliveryDate())
+			t, _ := time.Parse(layout, g.DeliveryDate())
+			myLogger.Debugf("timeeeeeeeeeeeeeee", t)
+			dateSlice = append(dateSlice, t)
+			GRNsWithBOL = append(GRNsWithBOL, g)
+		} else {
+			t1, _ := time.Parse(layout, g.DeliveryDate())
+			myLogger.Debugf("timeeeeeeeeeeeeeee", t1)
+			dateSlice1 = append(dateSlice1, t1)
+			GRNsWithoutBOL = append(GRNsWithoutBOL, g)
+		}
+	}
+
+	myLogger.Debugf("In date FIFO GRNsWithBOL", GRNsWithBOL)
+	myLogger.Debugf("In date FIFO GRNsWithoutBOL", GRNsWithoutBOL)
+
+	myLogger.Debugf("First list before sorting===========", dateSlice)
+	myLogger.Debugf("First list before sorting===========", dateSlice1)
+
+	sort.Sort(dateSlice)
+	sort.Sort(dateSlice1)
+	for _, g1 := range GRNsWithBOL {
+		t3, _ := time.Parse(layout, g1.DeliveryDate())
+		if dateSlice[0] == t3 {
+			myLogger.Debugf("Please enter and save my life==================")
+			return g1
+		}
+	}
+	for _, g2 := range GRNsWithoutBOL {
+		t4, _ := time.Parse(layout, g2.DeliveryDate())
+		if dateSlice1[0] == t4 {
+			myLogger.Debugf("Please enter and save my life==================")
+			return g2
+		}
+	}
+	return grnList[0]
+
+}
+func MatchQuantityWithGRN_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("GRN BUYER ACTION >>>>>>>>>>>>>>>>>> ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		// @TODO : What values does EASY ROBO NEED? PASS THEM IN THE ADDITIONAL INFO
+		invStat, _ = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_EASY_ROBO_GRN, invStat.ReasonCode(), invStat.Comments(), "ST0905", EMPTY_ADDITIONAL_INFO)
+		return 2, errStr, invStat
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+		myLogger.Debugf("Revert GRN Start")
+		RevertGRNResidualQuantity(stub, invoice)
+		STORE_INVOICE = true
+		SetInvoiceForProcessing(invoice)
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(),invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0906", EMPTY_ADDITIONAL_INFO)
+
+	} else if invStat.Status() == USR_BUYER_ACT_ALT_GRN {
+		linesWithGRNMismatch := ""
+		for _, line := range *invoice.DcLines() {
+			candidateGrnsOnDate := filterGrnsOnDate(invoice, *line.GrnMatch())
+			var grnTotalQty float64
+			grnTotalQty = 0.0
+			for _, grn := range candidateGrnsOnDate {
+				var grnLineItem []gr.GRNLineItem
+				grnLineItem = *grn.LineItems()
+				grnTotalQty = grnTotalQty + grnLineItem[0].PoQuantity()
+			}
+			if grnTotalQty < line.Amount() {
+				if linesWithGRNMismatch != "" {
+					linesWithGRNMismatch = linesWithGRNMismatch + "and"
+				}
+				linesWithGRNMismatch = linesWithGRNMismatch + util.GetStringFromInt(line.InvoiceLine())
+			}
+		}
+		if linesWithGRNMismatch == "" {
+			invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0901", EMPTY_ADDITIONAL_INFO)
+			return 1, errStr, invStat
+		}
+		invStat, _ = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, invStat.ReasonCode(), invStat.Comments(), "ST0908", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}
+
+// SPLIT AND MERGE
+func isCompletedMatching(invoice Invoice, candidateGrns []gr.GRN) bool {
+	invoiceLinesPending := false
+	for _, line := range *invoice.DcLines() {
+		if len(*line.GrnMatch()) == 0 {
+			invoiceLinesPending = true
+		}
+	}
+
+	grnPending := false
+	for _, grn := range candidateGrns {
+		if GetUpdatedResidualGRNQty(grn) > 0 {
+			grnPending = true
+		}
+	}
+
+	if invoiceLinesPending && grnPending {
+		return false
+	}
+	return true
+}
+
+func getInvoiceLinesWithoutGRN() []DCLine {
+	var invoiceLines []DCLine
+	for _, line := range *UPDATED_INVOICE.DcLines() {
+		if len(*line.GrnMatch()) == 0 {
+			invoiceLines = append(invoiceLines, line)
+		}
+	}
+	return invoiceLines
+}
+
+func getNextInvoiceLine(uniquePOLine string) (string, string) {
+
+	for _, line := range *UPDATED_INVOICE.DcLines() {
+		if len(*line.GrnMatch()) == 0 && line.PoLine() == util.GetIntFromString(uniquePOLine) {
+			return util.GetStringFromInt(line.InvoiceLine()), util.GetStringFromFloat(line.Amount())
+		}
+	}
+	return "", ""
+}
+
+func getNextGRN(candidateGrns []gr.GRN) gr.GRN {
+	var grn gr.GRN
+	for _, g := range candidateGrns {
+		if GetUpdatedResidualGRNQty(g) > 0 {
+			grn = g
+			return grn
+		}
+	}
+	return grn
+}
+
+func MatchGRNForMergedLines(stub shim.ChaincodeStubInterface, invoice Invoice, lineNums []string, grn gr.GRN) {
+
+	line := MergeInvoiceLines(UPDATED_INVOICE, lineNums)
+	line.SetGrnMatch([]gr.GRN{grn})
+	myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled4>>>>>>>>>>>>>>>>>>>")
+	UpdateGrnResidualQty(stub, grn, GetUpdatedResidualGRNQty(grn), "", 0)
+}
+
+func SplitAndMergeInvoiceLines(stub shim.ChaincodeStubInterface, invoice Invoice, lineNums []string, grn gr.GRN) {
+	var lineQty float64
+	lineQty = 0.0
+	var selectedLines []DCLine
+	var selectedLinesToMerge []string
+	var lineItem DCLine
+	for _, line := range *invoice.DcLines() {
+		if util.StringArrayContains(lineNums, util.GetStringFromInt(line.InvoiceLine())) {
+			tmpQty := lineQty + line.Quantity()
+			if lineQty > GetUpdatedResidualGRNQty(grn) {
+				break
+			}
+			lineQty = tmpQty
+			selectedLinesToMerge = append(selectedLinesToMerge, util.GetStringFromInt(line.InvoiceLine()))
+			lineItem = line
+		} else {
+			selectedLines = append(selectedLines, line)
+		}
+	}
+
+	lineItem.SetAmount(lineQty)
+
+	lineItem.SetGrnMatch([]gr.GRN{grn})
+	selectedLines = append(selectedLines, lineItem)
+	myLogger.Debugf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>UpdateGRNCalled5>>>>>>>>>>>>>>>>>>>")
+	UpdateGrnResidualQty(stub, grn, lineQty, "", 0)
+
+	var lineItem1 DCLine
+	lineItem1 = lineItem
+	lineItem1.SetAmount(GetUpdatedResidualGRNQty(grn) - lineQty)
+	selectedLines = append(selectedLines, lineItem1)
+
+	UPDATED_INVOICE.SetDcLines(selectedLines)
+}
+
+func SplitOrMergeInvoiceToGetPossibleGRNMatches(stub shim.ChaincodeStubInterface, uniquePOLine string, candidateGrns []gr.GRN) {
+	isCompletedProcessing := false
+
+	for !isCompletedProcessing {
+		grn := getNextGRN(candidateGrns)
+		isCompleted := false
+		for !isCompleted {
+			done := false
+			var lineNums []string
+			lineTotAmt := 0.0
+			for !done {
+				lineNum, amt := getNextInvoiceLine(uniquePOLine)
+
+				lineTotAmt = lineTotAmt + util.GetFloatFromString(amt)
+				if (lineNum == "" && amt == "") || lineTotAmt > GetUpdatedResidualGRNQty(grn) {
+					SplitAndMergeInvoiceLines(stub, UPDATED_INVOICE, lineNums, grn)
+					done = true
+				}
+				if lineTotAmt == GetUpdatedResidualGRNQty(grn) {
+					MatchGRNForMergedLines(stub, UPDATED_INVOICE, lineNums, grn)
+					done = true
+				}
+				lineNums = append(lineNums, lineNum)
+			}
+			isCompleted = true
+		}
+		isCompletedProcessing = isCompletedMatching(UPDATED_INVOICE, candidateGrns)
+	}
+}
+
+func GroupInvoiceLineItems(stub shim.ChaincodeStubInterface) {
+	var uniquePoLineNumbers []string
+	for _, line := range *UPDATED_INVOICE.DcLines() {
+		if !(util.StringArrayContains(uniquePoLineNumbers, util.GetStringFromInt(line.PoLine()))) {
+			uniquePoLineNumbers = append(uniquePoLineNumbers, util.GetStringFromInt(line.PoLine()))
+		}
+	}
+
+	for _, uniquePOLine := range uniquePoLineNumbers {
+		var invoiceLineNumbers []string
+		for _, line := range *UPDATED_INVOICE.DcLines() {
+			if util.GetStringFromInt(line.PoLine()) == uniquePOLine && len(*line.GrnMatch()) == 0 {
+				invoiceLineNumbers = append(invoiceLineNumbers, util.GetStringFromInt(line.InvoiceLine()))
+			}
+		}
+		MergeInvoiceLines(UPDATED_INVOICE, invoiceLineNumbers)
+	}
+	return
+}
+
+func MergeInvoiceLines(invoice Invoice, invoiceLineNumbers []string) DCLine {
+	var invoiceLines []DCLine
+	var invoiceLine DCLine
+	var Unit_Price, quantity float64
+	Unit_Price = 0.0
+	quantity = 0.0
+	for _, line := range *UPDATED_INVOICE.DcLines() {
+		if !(util.StringArrayContains(invoiceLineNumbers, util.GetStringFromInt(line.InvoiceLine()))) {
+			invoiceLines = append(invoiceLines, line)
+		} else {
+			invoiceLine = line
+			if line.Quantity() == 1 {
+				Unit_Price = Unit_Price + line.UnitPrice()
+				quantity = line.Quantity()
+			} else {
+				Unit_Price = line.UnitPrice()
+				quantity = quantity + line.Quantity()
+			}
+		}
+	}
+
+	invoiceLine.SetQuantity(quantity)
+	invoiceLine.SetUnitPrice(Unit_Price)
+	invoiceLine.SetInvoiceLine(int64(rand.Intn(100000000)))
+	totalAmt := quantity * Unit_Price
+	invoiceLine.SetAmount(totalAmt)
+	UPDATED_INVOICE.SetDcLines(invoiceLines)
+	UPDATED_INVOICE.SetDcLines(append(*UPDATED_INVOICE.DcLines(), invoiceLine))
+
+	return invoiceLine
+}
+
+// END OF  SPLIT AND MERGE

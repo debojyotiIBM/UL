@@ -1,0 +1,164 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"strings"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/po"
+	"github.com/ibm/p2p/vmd"
+)
+
+/*
+	The Vendor Name on invoice should match with the Vendor Name in VMD. If not send it to IBM AP for VMD modification and then get approval from Buyer
+*/
+
+func MatchVendorName(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+	var vendor vmd.Vendor
+	vendor, errStr = vmd.GetVendor(stub, invoice.DcDocumentData.DcHeader.ErpSystem, invoice.DcDocumentData.DcHeader.VendorID, invoice.DcDocumentData.DcHeader.Client)
+
+	if errStr != "" {
+		return 0, "Error in fetching vendor in stage 0", invStat
+	}
+	invoicePO, errStr := po.GetPO(stub, []string{invoice.DcDocumentData.DcHeader.ErpSystem, invoice.DcDocumentData.DcHeader.PoNumber})
+	if errStr != "" {
+		return 0, "Error in fetching PO in stage 0", invStat
+	}
+
+	myLogger.Debugf("Supplier Name in invoice - ", invoice.DcDocumentData.DcSwissHeader.SupplierName)
+	myLogger.Debugf("Supplier Name in VMD - ", vendor.VendorName)
+	if util.ProbableMatch(invoice.DcDocumentData.DcSwissHeader.SupplierName, vendor.VendorName) && isVendorAddressMatching(invoice, vendor) {
+
+		if !vendor.IsPaymentBlocked() && vendor.IsDeleted() {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_DELETED, "", "ST0410", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		} else if vendor.IsPaymentBlocked() && !vendor.IsDeleted() {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_BLOCKED, "", "ST0409", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		} else if vendor.IsPaymentBlocked() && vendor.IsDeleted() {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_DELETED_BLOCKED, "", "ST0411", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		}
+		CCExists := false
+		for _, vendorCC := range *vendor.CompanyCodeDetails() {
+			if invoicePO.CompanyCode() == vendorCC.CompanyCode() {
+				var CC_ADDITIONAL_INFO AdditionalInfo
+				CC_ADDITIONAL_INFO.SetType("CompanyCode")
+				CC_ADDITIONAL_INFO.SetValue(vendorCC.CompanyCode())
+				CCExists = true
+				if vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_POSTING, "", "ST0412", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else if !vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_PAYMENT, "", "ST0413", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else if !vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED, "", "ST0414", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else if vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_POSTING, "", "ST0415", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else if !vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_PAYMENT, "", "ST0416", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else if vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_POSTING_PAYMENT, "", "ST0417", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else if vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_POSTING_PAYMENT, "", "ST0418", CC_ADDITIONAL_INFO)
+					return 2, errStr, invStat
+				} else {
+					myLogger.Debugf("VENDOR NAME AND ADDRESS MATCHES")
+					//added vendor address check also
+					invStat = UpdateInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PROCESSING, "", "", "ST0001", EMPTY_ADDITIONAL_INFO)
+					return 1, "", invStat
+				}
+			}
+		}
+		if !CCExists {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_VMD_CC_NOT_ENTENDED_PO_CC, "", "ST0419", EMPTY_ADDITIONAL_INFO)
+			return 2, errStr, invStat
+		}
+
+	}
+
+	myLogger.Debugf("VENDOR NAME OR ADDRESS DOESN'T MATCH")
+	if invStat.Status() == INV_STATUS_WAITING_VENDOR_REFRESH {
+		myLogger.Debugf("VENDOR NAME OR ADDRESS DOESN'T MATCH - still waiting for VMD refresh")
+		invStat = CreateInvoiceStatus(stub, invStat.BciId(), invoice.DcDocumentData.DcHeader.ScanID, "", "", "", "ST0005", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == INV_STATUS_PENDING_VMD && invStat.ReasonCode() == INV_RS_PENDING_VMD_UPDATE {
+		invStat = CreateInvoiceStatus(stub, invStat.BciId(), invoice.DcDocumentData.DcHeader.ScanID, "", "", "", "ST0003", EMPTY_ADDITIONAL_INFO)
+	} else {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID, invoice.DcDocumentData.DcHeader.ScanID, INV_STATUS_PENDING_AP, INV_RS_INVALID_VENDOR_NAME, "", "ST0002", EMPTY_ADDITIONAL_INFO)
+	}
+	return 2, errStr, invStat
+}
+
+func isVendorAddressMatching(invoice Invoice, vendorDetails vmd.Vendor) bool {
+
+	addrTokens := strings.Split(vendorDetails.VendorAddress(), "|")
+	// Supplier_Address1 = street , Supplier_Address2 = street2 , Supplier_Address3 = City
+	// Supplier_Address4 = Region , Supplier_Address5 = postalcode , Supplier_Address6 = country
+
+	myLogger.Debugf("Supplier_Address3 %s\n", invoice.SupplierAddress3())
+	myLogger.Debugf("addrTokens[0] - %s", addrTokens[0])
+	myLogger.Debugf("addrTokens - ", addrTokens)
+	if len(addrTokens) >= 5 {
+		myLogger.Debugf("sufficient addr tokens")
+		poBox := ""
+		if invoice.SupplierAddress7() == "" {
+			poBox = invoice.SupplierAddress1()
+		}
+		myLogger.Debugf("poBox - ", poBox)
+		myLogger.Debugf("util.ProbableMatch(invoice.SupplierAddress3(), addrTokens[0]) ", util.ProbableMatch(invoice.SupplierAddress3(), addrTokens[0]))
+		myLogger.Debugf("util.ProbableMatch(invoice.SupplierAddress4(), addrTokens[0]) ", util.ProbableMatch(invoice.SupplierAddress4(), addrTokens[1]))
+		myLogger.Debugf("util.ProbableMatch(invoice.SupplierAddress5(), addrTokens[0]) ", util.ProbableMatch(invoice.SupplierAddress5(), addrTokens[2]))
+		myLogger.Debugf("util.ProbableMatch(invoice.SupplierAddress6(), addrTokens[0]) ", util.ProbableMatch(invoice.SupplierAddress6(), addrTokens[3]))
+		myLogger.Debugf("util.ProbableMatch(poBox, addrTokens[4])", util.ProbableMatch(poBox, addrTokens[4]))
+
+		if util.ProbableMatch(invoice.SupplierAddress3(), addrTokens[0]) &&
+			util.ProbableMatch(invoice.SupplierAddress4(), addrTokens[1]) &&
+			(invoice.SupplierAddress5() == addrTokens[2]) &&
+			util.ProbableMatch(invoice.SupplierAddress6(), addrTokens[3]) &&
+			(poBox == addrTokens[4]) {
+			return true
+		}
+	}
+	myLogger.Debugf("VENDOR TO ADDRESS DOESN'T MATCH")
+	return false
+}
+
+func MatchVendorName_AP_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	var errStr string
+	myLogger.Debugf("IBM AP ACTION - ", invStat.Status())
+	if invStat.Status() == USR_AP_ACT_PENDING_VMD {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_VMD, INV_RS_PENDING_VMD_UPDATE, invStat.Comments(), "ST0003", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USER_RC_AP_REMITTOID_RET_BUYER {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, invStat.ReasonCode(), invStat.Comments(), "ST0004", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_VMD_UPDATED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_WAITING_VENDOR_REFRESH, invStat.ReasonCode(), invStat.Comments(), "ST0005", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0010", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.DcDocumentData.DcHeader.VendorID)))
+	}
+
+	return 2, errStr, invStat
+}
+
+func MatchVendorName_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("IBM BUYER ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0006", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.DcDocumentData.DcHeader.VendorID)))
+	} else if invStat.Status() == USR_BUYER_ACT_RETURN {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, invStat.ReasonCode(), invStat.Comments(), "ST0007", EMPTY_ADDITIONAL_INFO)
+	}
+	return 2, errStr, invStat
+}

@@ -1,0 +1,283 @@
+/*
+   Copyright IBM Corp. 2017 All Rights Reserved.
+   Licensed under the IBM India Pvt Ltd, Version 1.0 (the "License");
+   @author : Pushpalatha M Hiremath
+*/
+
+package invoice
+
+import (
+	"encoding/json"
+	"strings"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	"github.com/ibm/db"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/po"
+	"github.com/ibm/p2p/vmd"
+)
+
+/*
+	Remit to ID match
+*/
+
+func MatchRemitToID(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus, string) {
+	var invStat InvoiceStatus
+	var errStr string
+	var paymentMethod string
+	invoicePO, err := po.GetPO(stub, []string{invoice.ErpSystem(), invoice.PoNumber()})
+	SampleVendor, err := vmd.GetVendor(stub, invoice.ErpSystem(), invoice.VendorID())
+	if err == "" {
+		paymentMethod = getPaymentMethod(SampleVendor.PaymentMethod())
+	}
+	if invoice.BankAccount() != "" {
+		myLogger.Debugf("Bank Account ", invoice.BankAccount())
+		vendorRecords, _ := db.TableStruct{Stub: stub, TableName: util.TAB_VENDOR, PrimaryKeys: []string{}, Data: ""}.GetAll()
+		for _, vendorDetails := range vendorRecords {
+			var vendor vmd.Vendor
+			err := json.Unmarshal([]byte(vendorDetails), &vendor)
+			if err != nil {
+				myLogger.Debugf("ERROR in parsing input vendor :", err, vendorDetails)
+			}
+			//Lohit
+			for _, bankDetail := range *vendor.BankDetails() {
+				//
+				if invoice.BankAccount() == bankDetail.BankAccount() && invoice.BankCode() == bankDetail.BankCode() {
+					paymentMethod = getPaymentMethod(vendor.PaymentMethod())
+					myLogger.Debugf("Payment Method -  ", paymentMethod)
+
+					if paymentMethod == "BANK" {
+
+						if !vendor.IsPaymentBlocked() && vendor.IsDeleted() {
+							invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_DELETED, "", "ST0410", EMPTY_ADDITIONAL_INFO)
+							return 2, errStr, invStat, ""
+						} else if vendor.IsPaymentBlocked() && !vendor.IsDeleted() {
+							invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_BLOCKED, "", "ST0409", EMPTY_ADDITIONAL_INFO)
+							return 2, errStr, invStat, ""
+						} else if vendor.IsPaymentBlocked() && vendor.IsDeleted() {
+							invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_DELETED_BLOCKED, "", "ST0411", EMPTY_ADDITIONAL_INFO)
+							return 2, errStr, invStat, ""
+						}
+						CCExists := false
+						for _, vendorCC := range *vendor.CompanyCodeDetails() {
+							if invoicePO.CompanyCode() == vendorCC.CompanyCode() {
+								var CC_ADDITIONAL_INFO AdditionalInfo
+								CC_ADDITIONAL_INFO.SetType("CompanyCode")
+								CC_ADDITIONAL_INFO.SetValue(vendorCC.CompanyCode())
+								CCExists = true
+								if vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_POSTING, "", "ST0412", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else if !vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_PAYMENT, "", "ST0413", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else if !vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED, "", "ST0414", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else if vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_POSTING, "", "ST0415", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else if !vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_PAYMENT, "", "ST0416", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else if vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_POSTING_PAYMENT, "", "ST0417", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else if vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+									invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_POSTING_PAYMENT, "", "ST0418", CC_ADDITIONAL_INFO)
+									return 2, errStr, invStat, ""
+								} else {
+									myLogger.Debugf("REMIT TO ID MATCHES")
+									return checkTaxId(stub, invoice, vendor)
+									//return 1, errStr, invStat, vendor.VendorId
+								}
+							}
+						}
+						if !CCExists {
+							invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_NOT_ENTENDED_PO_CC, "", "ST0419", EMPTY_ADDITIONAL_INFO)
+							return 2, errStr, invStat, ""
+						}
+					}
+				}
+			}
+		}
+	}
+	myLogger.Debugf("Payment Method 01-  ", paymentMethod)
+	if paymentMethod == "CHEQUE" && invoice.SupplierFiscalName() == "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_MISSING_REMIT_ADDR, "", "ST0402", EMPTY_ADDITIONAL_INFO)
+		return 2, "", invStat, ""
+	}
+
+	if invoice.SupplierFiscalName() != "" {
+		vendorRecords, _ := db.TableStruct{Stub: stub, TableName: util.TAB_VENDOR, PrimaryKeys: []string{}, Data: ""}.GetAll()
+		for _, vendorDetails := range vendorRecords {
+			var vendor vmd.Vendor
+			err := json.Unmarshal([]byte(vendorDetails), &vendor)
+			if err != nil {
+				myLogger.Debugf("ERROR in parsing input vendor :", err, vendorDetails)
+			}
+			if invoice.SupplierFiscalName() == vendor.VendorName() && isAddressMatching(invoice, vendor) {
+				paymentMethod = getPaymentMethod(vendor.PaymentMethod())
+				myLogger.Debugf("paymentMethod 02", paymentMethod)
+				if paymentMethod == "CHEQUE" {
+					if !vendor.IsPaymentBlocked() && vendor.IsDeleted() {
+						invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_DELETED, "", "ST0410", EMPTY_ADDITIONAL_INFO)
+						return 2, errStr, invStat, ""
+					} else if vendor.IsPaymentBlocked() && !vendor.IsDeleted() {
+						invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_BLOCKED, "", "ST0409", EMPTY_ADDITIONAL_INFO)
+						return 2, errStr, invStat, ""
+					} else if vendor.IsPaymentBlocked() && vendor.IsDeleted() {
+						invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_DELETED_BLOCKED, "", "ST0411", EMPTY_ADDITIONAL_INFO)
+						return 2, errStr, invStat, ""
+					}
+					CCExists := false
+					for _, vendorCC := range *vendor.CompanyCodeDetails() {
+						if invoicePO.CompanyCode() == vendorCC.CompanyCode() {
+							var CC_ADDITIONAL_INFO AdditionalInfo
+							CC_ADDITIONAL_INFO.SetType("CompanyCode")
+							CC_ADDITIONAL_INFO.SetValue(vendorCC.CompanyCode())
+							CCExists = true
+							if vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_POSTING, "", "ST0412", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else if !vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_PAYMENT, "", "ST0413", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else if !vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED, "", "ST0414", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else if vendorCC.IsPostingBlocked() && !vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_POSTING, "", "ST0415", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else if !vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_PAYMENT, "", "ST0416", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else if vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && !vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_BLOCKED_POSTING_PAYMENT, "", "ST0417", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else if vendorCC.IsPostingBlocked() && vendorCC.IsPaymentBlocked() && vendorCC.IsDeleted() {
+								invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_DELETED_BLOCKED_POSTING_PAYMENT, "", "ST0418", CC_ADDITIONAL_INFO)
+								return 2, errStr, invStat, ""
+							} else {
+								myLogger.Debugf("REMIT TO ID MATCHES")
+								return checkTaxId(stub, invoice, vendor)
+								//return 1, errStr, invStat, vendor.VendorId
+							}
+						}
+					}
+					if !CCExists {
+						invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_VMD_CC_NOT_ENTENDED_PO_CC, "", "ST0419", EMPTY_ADDITIONAL_INFO)
+						return 2, errStr, invStat, ""
+					}
+				} else if paymentMethod == "BANK" {
+					invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_MISSING_BANK_ACC, "", "ST0403", EMPTY_ADDITIONAL_INFO)
+					return 2, errStr, invStat, vendor.VendorID()
+				}
+			}
+		}
+	}
+	myLogger.Debugf("REMIT TO ID DOESN'T MATCH - paymentMethod ==", paymentMethod)
+	if paymentMethod == "CHEQUE" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_MISSING_REMIT_ADDR, "", "ST0402", EMPTY_ADDITIONAL_INFO)
+		return 2, "", invStat, ""
+	}
+
+	myLogger.Debugf("REMIT TO ID STAGE DOESN'T MATCH  - DEFAULT CALLED for BANK ACCOUNT")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_MISSING_BANK_ACC, "", "ST0403", EMPTY_ADDITIONAL_INFO)
+	return 2, errStr, invStat, ""
+}
+
+func isAddressMatching(invoice Invoice, vendor vmd.Vendor) bool {
+	addrTokens := strings.Split(vendor.VendorAddress(), "|")
+	// Supplier_Fiscal_Address1 = street , Supplier_Fiscal_Address2 = street2 , Supplier_Fiscal_Address3 = City
+	// Supplier_Fiscal_Address4 = Region , Supplier_Fiscal_Address5 = postalcode , Supplier_Fiscal_Address6 = country
+
+	if len(addrTokens) >= 5 {
+		poBox := ""
+		if invoice.SupplierFiscalAddress7() == "" {
+			poBox = invoice.SupplierFiscalAddress1()
+		}
+
+		if util.ProbableMatch(invoice.SupplierFiscalAddress3(), addrTokens[0]) &&
+			util.ProbableMatch(invoice.SupplierFiscalAddress4(), addrTokens[1]) &&
+			(invoice.SupplierFiscalAddress5() == addrTokens[2]) &&
+			util.ProbableMatch(invoice.SupplierFiscalAddress6(), addrTokens[3]) &&
+			(poBox == addrTokens[4]) {
+			return true
+		}
+	}
+	myLogger.Debugf("REMIT TO ADDRESS DOESN'T MATCH")
+	return false
+}
+func getPaymentMethod(paymentMethod string) string {
+
+	if (paymentMethod == "A") || (paymentMethod == "B") || (paymentMethod == "E") || (paymentMethod == "G") || (paymentMethod == "M") ||
+		(paymentMethod == "S") || (paymentMethod == "T") || (paymentMethod == "X") {
+		return "BANK"
+	} else if paymentMethod == "C" {
+		return "CHEQUE"
+	}
+	return "INVALID"
+}
+
+func checkTaxId(stub shim.ChaincodeStubInterface, invoice Invoice, vendor vmd.Vendor) (int, string, InvoiceStatus, string) {
+	invVatCode := invoice.VendorVATCode()
+	vendorVatCode := vendor.TaxId()
+	var invStat InvoiceStatus
+	var errStr string
+	myLogger.Debugf("Invoice VAT code======= ", invVatCode)
+	myLogger.Debugf("Vendor VAT code======= ", vendorVatCode)
+
+	if ((invVatCode != "" || invVatCode != "N/A") && vendorVatCode != "" && invVatCode == vendorVatCode) ||
+		((invVatCode == "" || invVatCode == "N/A") && vendorVatCode == "") ||
+		((invVatCode == "" || invVatCode == "N/A") && vendorVatCode != "") {
+		myLogger.Debugf("Pass thro case============ ")
+		invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSING, "", "", "ST0401", EMPTY_ADDITIONAL_INFO)
+		//Inserting into table for duplicate check
+		db.TableStruct{Stub: stub, TableName: util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), util.GetStringFromFloat(invoice.TotalAmount()), vendor.VendorID()}, Data: ""}.Add()
+		myLogger.Debugf("Record added in the Unique table==============>")
+		return 1, errStr, invStat, vendor.VendorID()
+	}
+	myLogger.Debugf("Failure case============ ")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_AP, INV_RS_TAX_ID_MISMATCH, "", "ST0411", EMPTY_ADDITIONAL_INFO)
+	return 2, errStr, invStat, vendor.VendorID()
+}
+
+func MatchRemitToID_AP_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("IBM AP ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_AP_ACT_PENDING_VMD {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_VMD, INV_RS_PENDING_VMD_UPDATE, invStat.Comments(), "ST0406", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_REJ_CONFIRM_BUYER {
+		myLogger.Debugf("Buyer Action loop", invStat.Status())
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_BUYER, USR_AP_ACT_REJ_CONFIRM_BUYER, invStat.Comments(), "ST0407", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.Status() == USR_AP_ACT_REJECTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0408", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}
+
+func MatchRemitToID_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_REJECTED, invStat.ReasonCode(), invStat.Comments(), "ST0404", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.Status() == USR_BUYER_ACT_RETURN {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, invStat.ReasonCode(), invStat.Comments(), "ST0405", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}

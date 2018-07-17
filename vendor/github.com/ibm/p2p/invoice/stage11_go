@@ -1,0 +1,97 @@
+package invoice
+
+import (
+	"strings"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	util "github.com/ibm/p2p"
+	"github.com/ibm/p2p/companyCode"
+	"github.com/ibm/p2p/po"
+	"github.com/ibm/p2p/vmd"
+)
+
+/*
+ 		Check PO is for the correct Company Code
+
+		To fetch the Tax Reporting Country query VMD db with vendor ID in invoice.
+		The Tax Reporting Country need to match to the country of the company code taken from the Purchase Order table
+
+		Example:
+		Invoice shows  Tax Reporting Country:  US
+		From the PO table check that PO 123456 is associated with Company Code 012 and from the Company Code Table check if the Company Code 012 has country as US
+
+		Therefore the two match
+		If Tax Reporting Country in invoice does not relate to the company code on the PO i.e. they do not match then the invoice should be "Rejected" with reason code "PO# does not match  Tax Reporting Country"
+*/
+
+func VerifyReportability(stub shim.ChaincodeStubInterface, invoice Invoice) (int, string, InvoiceStatus) {
+	var invStat InvoiceStatus
+	var errStr string
+
+	po, poFetchErr := po.GetPO(stub, []string{invoice.PoNumber(), invoice.ErpSystem()})
+	if poFetchErr != "" {
+		invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+		return 2, errStr, invStat
+		// return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	cc, ccFetchErr := companyCode.GetCompanyCode(stub, po.CompanyCode())
+	if ccFetchErr != "" {
+		return 0, "ERROR parsing input PO in stage 02", invStat
+	}
+
+	// Note : For BillToAddress we can only consider the name, as the other address field format may hav evariations
+
+	myLogger.Debugf("Vendor ID in invoice - ", invoice.VendorID())
+	InvVendorDetails, err := vmd.GetVendor(stub, invoice.ErpSystem(), invoice.VendorID())
+	if err == "" {
+		InvAddrTokens := strings.Split(InvVendorDetails.VendorAddress(), "|")
+
+		//myLogger.Debugf("Tax Reporting country in invoice - ", invoice.TaxReportingCountry())
+		myLogger.Debugf("Tax Reporting country in invoice (taken from vmd db)- ", InvAddrTokens[3])
+		myLogger.Debugf("Country in CompanyCode  - ", cc.Country())
+		//if util.ProbableMatch(cc.Country(), invoice.TaxReportingCountry()) {
+		if util.ProbableMatch(cc.Country(), InvAddrTokens[3]) {
+			myLogger.Debugf("TAX REPORTING COUNTRY MATCHES")
+			invStat = UpdateInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSED, "", "", "ST01102", EMPTY_ADDITIONAL_INFO)
+			//db.TableStruct{Stub: stub, TableName:util.TAB_INV_UNIQUE_KEYS, PrimaryKeys: []string{invoice.InvoiceNumber(), invoice.TotalAmount(), VENDOR_ID}, Data: ""}.Add()
+			StoreInvoiceStatusHistory(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PROCESSED)
+			/*StorePOResiduals(stub)
+			StoreGRNResiduals(stub)*/
+			return 1, "", invStat
+		}
+	}
+	myLogger.Debugf("TAX REPORTING COUNTRY MATCHES DOESN'T MATCH")
+	invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_PENDING_BUYER, INV_RS_REPORTABILTY_APPROVAL, "", "ST01103", EMPTY_ADDITIONAL_INFO)
+	return 2, errStr, invStat
+
+}
+
+func Reportabilty_Buyer_Action(stub shim.ChaincodeStubInterface, invoice Invoice, invStat InvoiceStatus) (int, string, InvoiceStatus) {
+	myLogger.Debugf("BUYER ACTION - ", invStat.Status())
+	var errStr string
+	if invStat.Status() == USR_BUYER_ACT_ACCEPTED {
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PROCESSED, invStat.ReasonCode(), invStat.Comments(), "ST01104", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+	} else if invStat.Status() == USR_BUYER_ACT_REJECTED {
+		myLogger.Debugf("Revert GRN Start")
+		RevertGRNResidualQuantity(stub, invoice)
+		STORE_INVOICE = true
+		SetInvoiceForProcessing(invoice)
+		po, fetchErr := po.GetPO(stub, []string{invoice.PoNumber(), invoice.ErpSystem()})
+		if fetchErr != "" {
+			invStat, errStr = SetInvoiceStatus(stub, invoice.BCIID(), invoice.ScanID(), INV_STATUS_REJECTED, INV_RS_INVALID_PO, "", "ST0300", *GetAdditionalInfo("Supplier Email", GetSupplierEmail(stub, invoice.VendorID())))
+			return 2, errStr, invStat
+			// return 0, "ERROR parsing input PO in stage 01", invStat
+		}
+		PoBudgetRevert(stub, invoice, po)
+		invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), INV_STATUS_PENDING_AP, INV_STATUS_MANUAL_POSTING, invStat.Comments(), "ST01105", EMPTY_ADDITIONAL_INFO)
+	} else if invStat.ReasonCode() == USR_AP_ACT_DELEGATION_ACCEPTED {
+
+		errStr, invStat = BuyerDelegation(stub, invoice, invStat)
+
+		if errStr == "" {
+			invStat, errStr = SetInvoiceStatus(stub, invStat.BciId(), invStat.ScanID(), invStat.Status(), invStat.ReasonCode(), invStat.Comments(), invStat.InternalStatus(), EMPTY_ADDITIONAL_INFO)
+		}
+	}
+	return 2, errStr, invStat
+}
